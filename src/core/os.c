@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose and contributors.
+* Copyright (c) 2024 Calvin Rose and contributors.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -27,9 +27,10 @@
 #include "gc.h"
 #endif
 
+#include <stdlib.h>
+
 #ifndef JANET_REDUCED_OS
 
-#include <stdlib.h>
 #include <time.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -38,6 +39,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <locale.h>
 
 #ifdef JANET_BSD
 #include <sys/sysctl.h>
@@ -126,6 +128,8 @@ JANET_CORE_FN(os_which,
               "* :freebsd\n\n"
               "* :openbsd\n\n"
               "* :netbsd\n\n"
+              "* :dragonfly\n\n"
+              "* :bsd\n\n"
               "* :posix - A POSIX compatible system (default)\n\n"
               "May also return a custom keyword specified at build time.") {
     janet_fixarity(argc, 0);
@@ -150,6 +154,8 @@ JANET_CORE_FN(os_which,
     return janet_ckeywordv("netbsd");
 #elif defined(__OpenBSD__)
     return janet_ckeywordv("openbsd");
+#elif defined(__DragonFly__)
+    return janet_ckeywordv("dragonfly");
 #elif defined(JANET_BSD)
     return janet_ckeywordv("bsd");
 #else
@@ -169,6 +175,8 @@ JANET_CORE_FN(os_arch,
               "* :riscv64\n\n"
               "* :sparc\n\n"
               "* :wasm\n\n"
+              "* :s390\n\n"
+              "* :s390x\n\n"
               "* :unknown\n") {
     janet_fixarity(argc, 0);
     (void) argv;
@@ -195,6 +203,10 @@ JANET_CORE_FN(os_arch,
     return janet_ckeywordv("ppc");
 #elif (defined(__ppc64__) || defined(_ARCH_PPC64) || defined(_M_PPC))
     return janet_ckeywordv("ppc64");
+#elif (defined(__s390x__))
+    return janet_ckeywordv("s390x");
+#elif (defined(__s390__))
+    return janet_ckeywordv("s390");
 #else
     return janet_ckeywordv("unknown");
 #endif
@@ -225,10 +237,11 @@ JANET_CORE_FN(os_compiler,
 #undef janet_stringify
 
 JANET_CORE_FN(os_exit,
-              "(os/exit &opt x)",
+              "(os/exit &opt x force)",
               "Exit from janet with an exit code equal to x. If x is not an integer, "
-              "the exit with status equal the hash of x.") {
-    janet_arity(argc, 0, 1);
+              "the exit with status equal the hash of x. If `force` is truthy will exit immediately and "
+              "skip cleanup code.") {
+    janet_arity(argc, 0, 2);
     int status;
     if (argc == 0) {
         status = EXIT_SUCCESS;
@@ -238,7 +251,11 @@ JANET_CORE_FN(os_exit,
         status = EXIT_FAILURE;
     }
     janet_deinit();
-    exit(status);
+    if (argc >= 2 && janet_truthy(argv[1])) {
+        _Exit(status);
+    } else {
+        exit(status);
+    }
     return janet_wrap_nil();
 }
 
@@ -284,7 +301,6 @@ JANET_CORE_FN(os_cpu_count,
     return dflt;
 #endif
 }
-
 
 #ifndef JANET_NO_PROCESSES
 
@@ -497,8 +513,11 @@ static int proc_get_status(JanetProc *proc) {
         status = WEXITSTATUS(status);
     } else if (WIFSTOPPED(status)) {
         status = WSTOPSIG(status) + 128;
-    } else {
+    } else if (WIFSIGNALED(status)) {
         status = WTERMSIG(status) + 128;
+    } else {
+        /* Could possibly return -1 but for now, just panic */
+        janet_panicf("Undefined status code for process termination, %d.", status);
     }
     return status;
 }
@@ -514,7 +533,6 @@ static JanetEVGenericMessage janet_proc_wait_subr(JanetEVGenericMessage args) {
 
 /* Callback that is called in main thread when subroutine completes. */
 static void janet_proc_wait_cb(JanetEVGenericMessage args) {
-    janet_ev_dec_refcount();
     JanetProc *proc = (JanetProc *) args.argp;
     if (NULL != proc) {
         int status = args.tag;
@@ -527,7 +545,9 @@ static void janet_proc_wait_cb(JanetEVGenericMessage args) {
             JanetString s = janet_formatc("command failed with non-zero exit code %d", status);
             janet_cancel(args.fiber, janet_wrap_string(s));
         } else {
-            janet_schedule(args.fiber, janet_wrap_integer(status));
+            if (janet_fiber_can_resume(args.fiber)) {
+                janet_schedule(args.fiber, janet_wrap_integer(status));
+            }
         }
     }
 }
@@ -609,7 +629,11 @@ os_proc_wait_impl(JanetProc *proc) {
 
 JANET_CORE_FN(os_proc_wait,
               "(os/proc-wait proc)",
-              "Block until the subprocess completes. Returns the subprocess return code.") {
+              "Suspend the current fiber until the subprocess completes. Returns the subprocess return code. "
+              "os/proc-wait cannot be called twice on the same process. If `ev/with-deadline` cancels `os/proc-wait` "
+              "with an error or os/proc-wait is cancelled with any error caused by anything else, os/proc-wait still "
+              "finishes in the background. Only after os/proc-wait finishes, a process is cleaned up by the operating "
+              "system. Thus, a process becomes a zombie process if os/proc-wait is not called.") {
     janet_fixarity(argc, 1);
     JanetProc *proc = janet_getabstract(argv, 0, &ProcAT);
 #ifdef JANET_EV
@@ -620,12 +644,112 @@ JANET_CORE_FN(os_proc_wait,
 #endif
 }
 
+struct keyword_signal {
+    const char *keyword;
+    int signal;
+};
+
+#ifndef JANET_WINDOWS
+static const struct keyword_signal signal_keywords[] = {
+#ifdef SIGKILL
+    {"kill", SIGKILL},
+#endif
+    {"int", SIGINT},
+    {"abrt", SIGABRT},
+    {"fpe", SIGFPE},
+    {"ill", SIGILL},
+    {"segv", SIGSEGV},
+#ifdef SIGTERM
+    {"term", SIGTERM},
+#endif
+#ifdef SIGALRM
+    {"alrm", SIGALRM},
+#endif
+#ifdef SIGHUP
+    {"hup", SIGHUP},
+#endif
+#ifdef SIGPIPE
+    {"pipe", SIGPIPE},
+#endif
+#ifdef SIGQUIT
+    {"quit", SIGQUIT},
+#endif
+#ifdef SIGUSR1
+    {"usr1", SIGUSR1},
+#endif
+#ifdef SIGUSR2
+    {"usr2", SIGUSR2},
+#endif
+#ifdef SIGCHLD
+    {"chld", SIGCHLD},
+#endif
+#ifdef SIGCONT
+    {"cont", SIGCONT},
+#endif
+#ifdef SIGSTOP
+    {"stop", SIGSTOP},
+#endif
+#ifdef SIGTSTP
+    {"tstp", SIGTSTP},
+#endif
+#ifdef SIGTTIN
+    {"ttin", SIGTTIN},
+#endif
+#ifdef SIGTTOU
+    {"ttou", SIGTTOU},
+#endif
+#ifdef SIGBUS
+    {"bus", SIGBUS},
+#endif
+#ifdef SIGPOLL
+    {"poll", SIGPOLL},
+#endif
+#ifdef SIGPROF
+    {"prof", SIGPROF},
+#endif
+#ifdef SIGSYS
+    {"sys", SIGSYS},
+#endif
+#ifdef SIGTRAP
+    {"trap", SIGTRAP},
+#endif
+#ifdef SIGURG
+    {"urg", SIGURG},
+#endif
+#ifdef SIGVTALRM
+    {"vtlarm", SIGVTALRM},
+#endif
+#ifdef SIGXCPU
+    {"xcpu", SIGXCPU},
+#endif
+#ifdef SIGXFSZ
+    {"xfsz", SIGXFSZ},
+#endif
+    {NULL, 0},
+};
+
+static int get_signal_kw(const Janet *argv, int32_t n) {
+    JanetKeyword signal_kw = janet_getkeyword(argv, n);
+    const struct keyword_signal *ptr = signal_keywords;
+    while (ptr->keyword) {
+        if (!janet_cstrcmp(signal_kw, ptr->keyword)) {
+            return ptr->signal;
+        }
+        ptr++;
+    }
+    janet_panicf("undefined signal %v", argv[n]);
+}
+#endif
+
 JANET_CORE_FN(os_proc_kill,
-              "(os/proc-kill proc &opt wait)",
+              "(os/proc-kill proc &opt wait signal)",
               "Kill a subprocess by sending SIGKILL to it on posix systems, or by closing the process "
-              "handle on windows. If `wait` is truthy, will wait for the process to finish and "
-              "returns the exit code. Otherwise, returns `proc`.") {
-    janet_arity(argc, 1, 2);
+              "handle on windows. If os/proc-wait already finished for proc, os/proc-kill raises an error. After "
+              "sending signal to proc, if `wait` is truthy, will wait for the process to finish and return the exit "
+              "code by calling os/proc-wait. Otherwise, returns `proc`. If signal is specified, send it instead. "
+              "Signal keywords are named after their C counterparts but in lowercase with the leading `SIG` stripped. "
+              "Signals are ignored on windows.") {
+    janet_arity(argc, 1, 3);
     JanetProc *proc = janet_getabstract(argv, 0, &ProcAT);
     if (proc->flags & JANET_PROC_WAITED) {
         janet_panicf("cannot kill process that has already finished");
@@ -639,9 +763,13 @@ JANET_CORE_FN(os_proc_kill,
     CloseHandle(proc->pHandle);
     CloseHandle(proc->tHandle);
 #else
-    int status = kill(proc->pid, SIGKILL);
+    int signal = -1;
+    if (argc == 3) {
+        signal = get_signal_kw(argv, 2);
+    }
+    int status = kill(proc->pid, signal == -1 ? SIGKILL : signal);
     if (status) {
-        janet_panic(strerror(errno));
+        janet_panic(janet_strerror(errno));
     }
 #endif
     /* After killing process we wait on it. */
@@ -659,8 +787,9 @@ JANET_CORE_FN(os_proc_kill,
 
 JANET_CORE_FN(os_proc_close,
               "(os/proc-close proc)",
-              "Wait on a process if it has not been waited on, and close pipes created by `os/spawn` "
-              "if they have not been closed. Returns nil.") {
+              "Close pipes created by `os/spawn` if they have not been closed. Then, if os/proc-wait was not already "
+              "called on proc, os/proc-wait is called on it, and it returns the exit code returned by os/proc-wait. "
+              "Otherwise, returns nil.") {
     janet_fixarity(argc, 1);
     JanetProc *proc = janet_getabstract(argv, 0, &ProcAT);
 #ifdef JANET_EV
@@ -697,6 +826,106 @@ static void close_handle(JanetHandle handle) {
     close(handle);
 #endif
 }
+
+#ifdef JANET_EV
+
+#ifndef JANET_WINDOWS
+static void janet_signal_callback(JanetEVGenericMessage msg) {
+    int sig = msg.tag;
+    if (msg.argi) janet_interpreter_interrupt_handled(NULL);
+    Janet handlerv = janet_table_get(&janet_vm.signal_handlers, janet_wrap_integer(sig));
+    if (!janet_checktype(handlerv, JANET_FUNCTION)) {
+        /* Let another thread/process try to handle this */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, sig);
+#ifdef JANET_THREADS
+        pthread_sigmask(SIG_BLOCK, &set, NULL);
+#else
+        sigprocmask(SIG_BLOCK, &set, NULL);
+#endif
+        raise(sig);
+        return;
+    }
+    JanetFunction *handler = janet_unwrap_function(handlerv);
+    JanetFiber *fiber = janet_fiber(handler, 64, 0, NULL);
+    janet_schedule_soon(fiber, janet_wrap_nil(), JANET_SIGNAL_OK);
+}
+
+static void janet_signal_trampoline_no_interrupt(int sig) {
+    /* Do not interact with global janet state here except for janet_ev_post_event, unsafe! */
+    JanetEVGenericMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.tag = sig;
+    janet_ev_post_event(&janet_vm, janet_signal_callback, msg);
+}
+
+static void janet_signal_trampoline(int sig) {
+    /* Do not interact with global janet state here except for janet_ev_post_event, unsafe! */
+    JanetEVGenericMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.tag = sig;
+    msg.argi = 1;
+    janet_interpreter_interrupt(NULL);
+    janet_ev_post_event(&janet_vm, janet_signal_callback, msg);
+}
+#endif
+
+JANET_CORE_FN(os_sigaction,
+              "(os/sigaction which &opt handler interrupt-interpreter)",
+              "Add a signal handler for a given action. Use nil for the `handler` argument to remove a signal handler. "
+              "All signal handlers are the same as supported by `os/proc-kill`.") {
+    janet_sandbox_assert(JANET_SANDBOX_SIGNAL);
+    janet_arity(argc, 1, 3);
+#ifdef JANET_WINDOWS
+    (void) argv;
+    janet_panic("unsupported on this platform");
+#else
+    /* TODO - per thread signal masks */
+    int rc;
+    int sig = get_signal_kw(argv, 0);
+    JanetFunction *handler = janet_optfunction(argv, argc, 1, NULL);
+    int can_interrupt = janet_optboolean(argv, argc, 2, 0);
+    Janet oldhandler = janet_table_get(&janet_vm.signal_handlers, janet_wrap_integer(sig));
+    if (!janet_checktype(oldhandler, JANET_NIL)) {
+        janet_gcunroot(oldhandler);
+    }
+    if (NULL != handler) {
+        Janet handlerv = janet_wrap_function(handler);
+        janet_gcroot(handlerv);
+        janet_table_put(&janet_vm.signal_handlers, janet_wrap_integer(sig), handlerv);
+    } else {
+        janet_table_put(&janet_vm.signal_handlers, janet_wrap_integer(sig), janet_wrap_nil());
+    }
+    struct sigaction action;
+    sigset_t mask;
+    sigaddset(&mask, sig);
+    memset(&action, 0, sizeof(action));
+    action.sa_flags |= SA_RESTART;
+    if (can_interrupt) {
+#ifdef JANET_NO_INTERPRETER_INTERRUPT
+        janet_panic("interpreter interrupt not enabled");
+#else
+        action.sa_handler = janet_signal_trampoline;
+#endif
+    } else {
+        action.sa_handler = janet_signal_trampoline_no_interrupt;
+    }
+    action.sa_mask = mask;
+    RETRY_EINTR(rc, sigaction(sig, &action, NULL));
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, sig);
+#ifdef JANET_THREADS
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+#else
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+#endif
+    return janet_wrap_nil();
+#endif
+}
+
+#endif
 
 /* Create piped file for os/execute and os/spawn. Need to be careful that we mark
    the error flag if we can't create pipe and don't leak handles. *handle will be cleaned
@@ -877,11 +1106,18 @@ static JanetFile *get_stdio_for_handle(JanetHandle handle, void *orig, int iswri
 }
 #endif
 
-static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
+typedef enum {
+    JANET_EXECUTE_EXECUTE,
+    JANET_EXECUTE_SPAWN,
+    JANET_EXECUTE_EXEC
+} JanetExecuteMode;
+
+static Janet os_execute_impl(int32_t argc, Janet *argv, JanetExecuteMode mode) {
     janet_sandbox_assert(JANET_SANDBOX_SUBPROCESS);
     janet_arity(argc, 1, 3);
 
     /* Get flags */
+    int is_spawn = mode == JANET_EXECUTE_SPAWN;
     uint64_t flags = 0;
     if (argc > 1) {
         flags = janet_getflags(argv, 1, "epxd");
@@ -905,7 +1141,7 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     int pipe_owner_flags = (is_spawn && (flags & 0x8)) ? JANET_PROC_ALLOW_ZOMBIE : 0;
 
     /* Get optional redirections */
-    if (argc > 2) {
+    if (argc > 2 && (mode != JANET_EXECUTE_EXEC)) {
         JanetDictView tab = janet_getdictionary(argv, 2);
         Janet maybe_stdin = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("in"));
         Janet maybe_stdout = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("out"));
@@ -970,7 +1206,6 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
         startupInfo.hStdInput = (HANDLE) _get_osfhandle(0);
     }
 
-
     if (pipe_out != JANET_HANDLE_NONE) {
         startupInfo.hStdOutput = pipe_out;
     } else if (new_out != JANET_HANDLE_NONE) {
@@ -1027,11 +1262,31 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
      * of posix_spawn would modify the argv array passed in. */
     char *const *cargv = (char *const *)child_argv;
 
-    /* Use posix_spawn to spawn new process */
-
     if (use_environ) {
         janet_lock_environ();
     }
+
+    /* exec mode */
+    if (mode == JANET_EXECUTE_EXEC) {
+#ifdef JANET_WINDOWS
+        janet_panic("not supported on windows");
+#else
+        int status;
+        if (!use_environ) {
+            environ = envp;
+        }
+        do {
+            if (janet_flag_at(flags, 1)) {
+                status = execvp(cargv[0], cargv);
+            } else {
+                status = execv(cargv[0], cargv);
+            }
+        } while (status == -1 && errno == EINTR);
+        janet_panicf("%p: %s", cargv[0], janet_strerror(errno ? errno : ENOENT));
+#endif
+    }
+
+    /* Use posix_spawn to spawn new process */
 
     /* Posix spawn setup */
     posix_spawn_file_actions_t actions;
@@ -1039,21 +1294,23 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     if (pipe_in != JANET_HANDLE_NONE) {
         posix_spawn_file_actions_adddup2(&actions, pipe_in, 0);
         posix_spawn_file_actions_addclose(&actions, pipe_in);
-    } else if (new_in != JANET_HANDLE_NONE) {
+    } else if (new_in != JANET_HANDLE_NONE && new_in != 0) {
         posix_spawn_file_actions_adddup2(&actions, new_in, 0);
-        posix_spawn_file_actions_addclose(&actions, new_in);
+        if (new_in != new_out && new_in != new_err)
+            posix_spawn_file_actions_addclose(&actions, new_in);
     }
     if (pipe_out != JANET_HANDLE_NONE) {
         posix_spawn_file_actions_adddup2(&actions, pipe_out, 1);
         posix_spawn_file_actions_addclose(&actions, pipe_out);
-    } else if (new_out != JANET_HANDLE_NONE) {
+    } else if (new_out != JANET_HANDLE_NONE && new_out != 1) {
         posix_spawn_file_actions_adddup2(&actions, new_out, 1);
-        posix_spawn_file_actions_addclose(&actions, new_out);
+        if (new_out != new_err)
+            posix_spawn_file_actions_addclose(&actions, new_out);
     }
     if (pipe_err != JANET_HANDLE_NONE) {
         posix_spawn_file_actions_adddup2(&actions, pipe_err, 2);
         posix_spawn_file_actions_addclose(&actions, pipe_err);
-    } else if (new_err != JANET_HANDLE_NONE) {
+    } else if (new_err != JANET_HANDLE_NONE && new_err != 2) {
         posix_spawn_file_actions_adddup2(&actions, new_err, 2);
         posix_spawn_file_actions_addclose(&actions, new_err);
     }
@@ -1081,7 +1338,8 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
 
     os_execute_cleanup(envp, child_argv);
     if (status) {
-        janet_panicf("%p: %s", argv[0], strerror(errno));
+        /* correct for macos bug where errno is not set */
+        janet_panicf("%p: %s", argv[0], janet_strerror(errno ? errno : ENOENT));
     }
 
 #endif
@@ -1136,22 +1394,63 @@ JANET_CORE_FN(os_execute,
               "* :d - Don't try and terminate the process on garbage collection (allow spawning zombies).\n"
               "`env` is a table or struct mapping environment variables to values. It can also "
               "contain the keys :in, :out, and :err, which allow redirecting stdio in the subprocess. "
-              "These arguments should be core/file values. "
-              "Returns the exit status of the program.") {
-    return os_execute_impl(argc, argv, 0);
+              ":in, :out, and :err should be core/file values or core/stream values. core/file values and core/stream "
+              "values passed to :in, :out, and :err should be closed manually because os/execute doesn't close them. "
+              "Returns the exit code of the program.") {
+    return os_execute_impl(argc, argv, JANET_EXECUTE_EXECUTE);
 }
 
 JANET_CORE_FN(os_spawn,
               "(os/spawn args &opt flags env)",
               "Execute a program on the system and return a handle to the process. Otherwise, takes the "
-              "same arguments as `os/execute`. Does not wait for the process. "
-              "For each of the :in, :out, and :err keys to the `env` argument, one "
-              "can also pass in the keyword `:pipe` "
-              "to get streams for standard IO of the subprocess that can be read from and written to. "
-              "The returned value `proc` has the fields :in, :out, :err, :return-code, and "
-              "the additional field :pid on unix-like platforms. Use `(os/proc-wait proc)` to rejoin the "
-              "subprocess or `(os/proc-kill proc)`.") {
-    return os_execute_impl(argc, argv, 1);
+              "same arguments as `os/execute`. Does not wait for the process. For each of the :in, :out, and :err keys "
+              "of the `env` argument, one can also pass in the keyword `:pipe` to get streams for standard IO of the "
+              "subprocess that can be read from and written to. The returned value `proc` has the fields :in, :out, "
+              ":err, and the additional field :pid on unix-like platforms. `(os/proc-wait proc)` must be called to "
+              "rejoin the subprocess. After `(os/proc-wait proc)` finishes, proc gains a new field, :return-code. "
+              "If :x flag is passed to os/spawn, non-zero exit code will cause os/proc-wait to raise an error. "
+              "If pipe streams created with :pipe keyword are not closed in time, janet can run out of file "
+              "descriptors. They can be closed individually, or `os/proc-close` can close all pipe streams on proc. "
+              "If pipe streams aren't read before `os/proc-wait` finishes, then pipe buffers become full, and the "
+              "process cannot finish because the process cannot print more on pipe buffers which are already full. "
+              "If the process cannot finish, os/proc-wait cannot finish, either.") {
+    return os_execute_impl(argc, argv, JANET_EXECUTE_SPAWN);
+}
+
+JANET_CORE_FN(os_posix_exec,
+              "(os/posix-exec args &opt flags env)",
+              "Use the execvpe or execve system calls to replace the current process with an interface similar to os/execute. "
+              "However, instead of creating a subprocess, the current process is replaced. Is not supported on windows, and "
+              "does not allow redirection of stdio.") {
+    return os_execute_impl(argc, argv, JANET_EXECUTE_EXEC);
+}
+
+JANET_CORE_FN(os_posix_fork,
+              "(os/posix-fork)",
+              "Make a `fork` system call and create a new process. Return nil if in the new process, otherwise a core/process object (as returned by os/spawn). "
+              "Not supported on all systems (POSIX only).") {
+    janet_sandbox_assert(JANET_SANDBOX_SUBPROCESS);
+    janet_fixarity(argc, 0);
+    (void) argv;
+#ifdef JANET_WINDOWS
+    janet_panic("not supported");
+#else
+    pid_t result;
+    do {
+        result = fork();
+    } while (result == -1 && errno == EINTR);
+    if (result == -1) {
+        janet_panic(janet_strerror(errno));
+    }
+    if (result) {
+        JanetProc *proc = janet_abstract(&ProcAT, sizeof(JanetProc));
+        memset(proc, 0, sizeof(JanetProc));
+        proc->pid = result;
+        proc->flags = JANET_PROC_ALLOW_ZOMBIE;
+        return janet_wrap_abstract(proc);
+    }
+    return janet_wrap_nil();
+#endif
 }
 
 #ifdef JANET_EV
@@ -1227,8 +1526,8 @@ JANET_CORE_FN(os_getenv,
     janet_sandbox_assert(JANET_SANDBOX_ENV);
     janet_arity(argc, 1, 2);
     const char *cstr = janet_getcstring(argv, 0);
-    const char *res = getenv(cstr);
     janet_lock_environ();
+    const char *res = getenv(cstr);
     Janet ret = res
                 ? janet_cstringv(res)
                 : argc == 2
@@ -1273,16 +1572,51 @@ JANET_CORE_FN(os_time,
 }
 
 JANET_CORE_FN(os_clock,
-              "(os/clock)",
-              "Return the number of whole + fractional seconds since some fixed point in time. The clock "
-              "is guaranteed to be non-decreasing in real time.") {
+              "(os/clock &opt source format)",
+              "Return the current time of the requested clock source.\n\n"
+              "The `source` argument selects the clock source to use, when not specified the default "
+              "is `:realtime`:\n"
+              "- :realtime: Return the real (i.e., wall-clock) time. This clock is affected by discontinuous "
+              "  jumps in the system time\n"
+              "- :monotonic: Return the number of whole + fractional seconds since some fixed point in "
+              "  time. The clock is guaranteed to be non-decreasing in real time.\n"
+              "- :cputime: Return the CPU time consumed by this process  (i.e. all threads in the process)\n"
+              "The `format` argument selects the type of output, when not specified the default is `:double`:\n"
+              "- :double: Return the number of seconds + fractional seconds as a double\n"
+              "- :int: Return the number of seconds as an integer\n"
+              "- :tuple: Return a 2 integer tuple [seconds, nanoseconds]\n") {
+    enum JanetTimeSource source;
     janet_sandbox_assert(JANET_SANDBOX_HRTIME);
-    janet_fixarity(argc, 0);
-    (void) argv;
+    janet_arity(argc, 0, 2);
+
+    JanetKeyword sourcestr = janet_optkeyword(argv, argc, 0, NULL);
+    if (sourcestr == NULL || janet_cstrcmp(sourcestr, "realtime") == 0) {
+        source = JANET_TIME_REALTIME;
+    } else if (janet_cstrcmp(sourcestr, "monotonic") == 0) {
+        source = JANET_TIME_MONOTONIC;
+    } else if (janet_cstrcmp(sourcestr, "cputime") == 0) {
+        source = JANET_TIME_CPUTIME;
+    } else {
+        janet_panicf("expected :realtime, :monotonic, or :cputime, got %v", argv[0]);
+    }
+
     struct timespec tv;
-    if (janet_gettime(&tv)) janet_panic("could not get time");
-    double dtime = tv.tv_sec + (tv.tv_nsec / 1E9);
-    return janet_wrap_number(dtime);
+    if (janet_gettime(&tv, source)) janet_panic("could not get time");
+
+    JanetKeyword formatstr = janet_optkeyword(argv, argc, 1, NULL);
+    if (formatstr == NULL || janet_cstrcmp(formatstr, "double") == 0) {
+        double dtime = (double)(tv.tv_sec + (tv.tv_nsec / 1E9));
+        return janet_wrap_number(dtime);
+    } else if (janet_cstrcmp(formatstr, "int") == 0) {
+        return janet_wrap_number((double)(tv.tv_sec));
+    } else if (janet_cstrcmp(formatstr, "tuple") == 0) {
+        Janet tup[2] = {janet_wrap_number((double)tv.tv_sec),
+                        janet_wrap_number((double)tv.tv_nsec)
+                       };
+        return janet_wrap_tuple(janet_tuple_n(tup, 2));
+    } else {
+        janet_panicf("expected :double, :int, or :tuple, got %v", argv[1]);
+    }
 }
 
 JANET_CORE_FN(os_sleep,
@@ -1304,6 +1638,23 @@ JANET_CORE_FN(os_sleep,
     RETRY_EINTR(rc, nanosleep(&ts, &ts));
 #endif
     return janet_wrap_nil();
+}
+
+JANET_CORE_FN(os_isatty,
+              "(os/isatty &opt file)",
+              "Returns true if `file` is a terminal. If `file` is not specified, "
+              "it will default to standard output.") {
+    janet_arity(argc, 0, 1);
+    FILE *f = (argc == 1) ? janet_getfile(argv, 0, NULL) : stdout;
+#ifdef JANET_WINDOWS
+    int fd = _fileno(f);
+    if (fd == -1) janet_panic("not a valid stream");
+    return janet_wrap_boolean(_isatty(fd));
+#else
+    int fd = fileno(f);
+    if (fd == -1) janet_panic(janet_strerror(errno));
+    return janet_wrap_boolean(isatty(fd));
+#endif
 }
 
 JANET_CORE_FN(os_cwd,
@@ -1346,6 +1697,40 @@ JANET_CORE_FN(os_cryptorand,
     return janet_wrap_buffer(buffer);
 }
 
+/* Helper function to get given or current time as local or UTC struct tm.
+ * - arg n+0: optional time_t to be converted, uses current time if not given
+ * - arg n+1: optional truthy to indicate the convnersion uses local time */
+static struct tm *time_to_tm(const Janet *argv, int32_t argc, int32_t n, struct tm *t_infos) {
+    time_t t;
+    if (argc > n && !janet_checktype(argv[n], JANET_NIL)) {
+        int64_t integer = janet_getinteger64(argv, n);
+        t = (time_t) integer;
+    } else {
+        time(&t);
+    }
+    struct tm *t_info = NULL;
+    if (argc > n + 1 && janet_truthy(argv[n + 1])) {
+        /* local time */
+#ifdef JANET_WINDOWS
+        _tzset();
+        localtime_s(t_infos, &t);
+        t_info = t_infos;
+#else
+        tzset();
+        t_info = localtime_r(&t, t_infos);
+#endif
+    } else {
+        /* utc time */
+#ifdef JANET_WINDOWS
+        gmtime_s(t_infos, &t);
+        t_info = t_infos;
+#else
+        t_info = gmtime_r(&t, t_infos);
+#endif
+    }
+    return t_info;
+}
+
 JANET_CORE_FN(os_date,
               "(os/date &opt time local)",
               "Returns the given time as a date struct, or the current time if `time` is not given. "
@@ -1363,34 +1748,8 @@ JANET_CORE_FN(os_date,
               "* :dst - if Day Light Savings is in effect") {
     janet_arity(argc, 0, 2);
     (void) argv;
-    time_t t;
     struct tm t_infos;
-    struct tm *t_info = NULL;
-    if (argc && !janet_checktype(argv[0], JANET_NIL)) {
-        int64_t integer = janet_getinteger64(argv, 0);
-        t = (time_t) integer;
-    } else {
-        time(&t);
-    }
-    if (argc >= 2 && janet_truthy(argv[1])) {
-        /* local time */
-#ifdef JANET_WINDOWS
-        _tzset();
-        localtime_s(&t_infos, &t);
-        t_info = &t_infos;
-#else
-        tzset();
-        t_info = localtime_r(&t, &t_infos);
-#endif
-    } else {
-        /* utc time */
-#ifdef JANET_WINDOWS
-        gmtime_s(&t_infos, &t);
-        t_info = &t_infos;
-#else
-        t_info = gmtime_r(&t, &t_infos);
-#endif
-    }
+    struct tm *t_info = time_to_tm(argv, argc, 0, &t_infos);
     JanetKV *st = janet_struct_begin(9);
     janet_struct_put(st, janet_ckeywordv("seconds"), janet_wrap_number(t_info->tm_sec));
     janet_struct_put(st, janet_ckeywordv("minutes"), janet_wrap_number(t_info->tm_min));
@@ -1402,6 +1761,34 @@ JANET_CORE_FN(os_date,
     janet_struct_put(st, janet_ckeywordv("year-day"), janet_wrap_number(t_info->tm_yday));
     janet_struct_put(st, janet_ckeywordv("dst"), janet_wrap_boolean(t_info->tm_isdst));
     return janet_wrap_struct(janet_struct_end(st));
+}
+
+#define SIZETIMEFMT     250
+
+JANET_CORE_FN(os_strftime,
+              "(os/strftime fmt &opt time local)",
+              "Format the given time as a string, or the current time if `time` is not given. "
+              "The time is formatted according to the same rules as the ISO C89 function strftime(). "
+              "The time is formatted in UTC unless `local` is truthy, in which case the date is formatted for "
+              "the local timezone.") {
+    janet_arity(argc, 1, 3);
+    const char *fmt = janet_getcstring(argv, 0);
+    /* ANSI X3.159-1989, section 4.12.3.5 "The strftime function" */
+    static const char *valid = "aAbBcdHIjmMpSUwWxXyYZ%";
+    const char *p = fmt;
+    while (*p) {
+        if (*p++ == '%') {
+            if (!strchr(valid, *p)) {
+                janet_panicf("invalid conversion specifier '%%%c'", *p);
+            }
+            p++;
+        }
+    }
+    struct tm t_infos;
+    struct tm *t_info = time_to_tm(argv, argc, 1, &t_infos);
+    char buf[SIZETIMEFMT];
+    (void)strftime(buf, SIZETIMEFMT, fmt, t_info);
+    return janet_cstringv(buf);
 }
 
 static int entry_getdst(Janet env_entry) {
@@ -1500,7 +1887,7 @@ JANET_CORE_FN(os_mktime,
     }
 
     if (t == (time_t) -1) {
-        janet_panicf("%s", strerror(errno));
+        janet_panicf("%s", janet_strerror(errno));
     }
 
     return janet_wrap_number((double)t);
@@ -1511,6 +1898,43 @@ JANET_CORE_FN(os_mktime,
 #else
 #define j_symlink symlink
 #endif
+
+JANET_CORE_FN(os_setlocale,
+              "(os/setlocale &opt locale category)",
+              "Set the system locale, which affects how dates and numbers are formatted. "
+              "Passing nil to locale will return the current locale. Category can be one of:\n\n"
+              " * :all (default)\n"
+              " * :collate\n"
+              " * :ctype\n"
+              " * :monetary\n"
+              " * :numeric\n"
+              " * :time\n\n"
+              "Returns the new locale if set successfully, otherwise nil. Note that this will affect "
+              "other functions such as `os/strftime` and even `printf`.") {
+    janet_arity(argc, 0, 2);
+    const char *locale_name = janet_optcstring(argv, argc, 0, NULL);
+    int category_int = LC_ALL;
+    if (argc > 1 && !janet_checktype(argv[1], JANET_NIL)) {
+        if (janet_keyeq(argv[1], "all")) {
+            category_int = LC_ALL;
+        } else if (janet_keyeq(argv[1], "collate")) {
+            category_int = LC_COLLATE;
+        } else if (janet_keyeq(argv[1], "ctype")) {
+            category_int = LC_CTYPE;
+        } else if (janet_keyeq(argv[1], "monetary")) {
+            category_int = LC_MONETARY;
+        } else if (janet_keyeq(argv[1], "numeric")) {
+            category_int = LC_NUMERIC;
+        } else if (janet_keyeq(argv[1], "time")) {
+            category_int = LC_TIME;
+        } else {
+            janet_panicf("expected one of :all, :collate, :ctype, :monetary, :numeric, or :time, got %v", argv[1]);
+        }
+    }
+    const char *old = setlocale(category_int, locale_name);
+    if (old == NULL) return janet_wrap_nil();
+    return janet_cstringv(old);
+}
 
 JANET_CORE_FN(os_link,
               "(os/link oldpath newpath &opt symlink)",
@@ -1529,7 +1953,7 @@ JANET_CORE_FN(os_link,
     const char *oldpath = janet_getcstring(argv, 0);
     const char *newpath = janet_getcstring(argv, 1);
     int res = ((argc == 3 && janet_truthy(argv[2])) ? j_symlink : link)(oldpath, newpath);
-    if (-1 == res) janet_panicf("%s: %s -> %s", strerror(errno), oldpath, newpath);
+    if (-1 == res) janet_panicf("%s: %s -> %s", janet_strerror(errno), oldpath, newpath);
     return janet_wrap_nil();
 #endif
 }
@@ -1548,7 +1972,7 @@ JANET_CORE_FN(os_symlink,
     const char *oldpath = janet_getcstring(argv, 0);
     const char *newpath = janet_getcstring(argv, 1);
     int res = j_symlink(oldpath, newpath);
-    if (-1 == res) janet_panicf("%s: %s -> %s", strerror(errno), oldpath, newpath);
+    if (-1 == res) janet_panicf("%s: %s -> %s", janet_strerror(errno), oldpath, newpath);
     return janet_wrap_nil();
 #endif
 }
@@ -1570,7 +1994,7 @@ JANET_CORE_FN(os_mkdir,
 #endif
     if (res == 0) return janet_wrap_true();
     if (errno == EEXIST) return janet_wrap_false();
-    janet_panicf("%s: %s", strerror(errno), path);
+    janet_panicf("%s: %s", janet_strerror(errno), path);
 }
 
 JANET_CORE_FN(os_rmdir,
@@ -1584,7 +2008,7 @@ JANET_CORE_FN(os_rmdir,
 #else
     int res = rmdir(path);
 #endif
-    if (-1 == res) janet_panicf("%s: %s", strerror(errno), path);
+    if (-1 == res) janet_panicf("%s: %s", janet_strerror(errno), path);
     return janet_wrap_nil();
 }
 
@@ -1599,7 +2023,7 @@ JANET_CORE_FN(os_cd,
 #else
     int res = chdir(path);
 #endif
-    if (-1 == res) janet_panicf("%s: %s", strerror(errno), path);
+    if (-1 == res) janet_panicf("%s: %s", janet_strerror(errno), path);
     return janet_wrap_nil();
 }
 
@@ -1623,7 +2047,7 @@ JANET_CORE_FN(os_touch,
         bufp = NULL;
     }
     int res = utime(path, bufp);
-    if (-1 == res) janet_panic(strerror(errno));
+    if (-1 == res) janet_panic(janet_strerror(errno));
     return janet_wrap_nil();
 }
 
@@ -1633,7 +2057,7 @@ JANET_CORE_FN(os_remove,
     janet_fixarity(argc, 1);
     const char *path = janet_getcstring(argv, 0);
     int status = remove(path);
-    if (-1 == status) janet_panicf("%s: %s", strerror(errno), path);
+    if (-1 == status) janet_panicf("%s: %s", janet_strerror(errno), path);
     return janet_wrap_nil();
 }
 
@@ -1652,7 +2076,7 @@ JANET_CORE_FN(os_readlink,
     const char *path = janet_getcstring(argv, 0);
     ssize_t len = readlink(path, buffer, sizeof buffer);
     if (len < 0 || (size_t)len >= sizeof buffer)
-        janet_panicf("%s: %s", strerror(errno), path);
+        janet_panicf("%s: %s", janet_strerror(errno), path);
     return janet_stringv((const uint8_t *)buffer, len);
 #endif
 }
@@ -1947,7 +2371,7 @@ JANET_CORE_FN(os_chmod,
 #else
     int res = chmod(path, os_getmode(argv, 1));
 #endif
-    if (-1 == res) janet_panicf("%s: %s", strerror(errno), path);
+    if (-1 == res) janet_panicf("%s: %s", janet_strerror(errno), path);
     return janet_wrap_nil();
 }
 
@@ -1983,7 +2407,7 @@ JANET_CORE_FN(os_dir,
         janet_panicf("path too long: %s", dir);
     sprintf(pattern, "%s/*", dir);
     intptr_t res = _findfirst(pattern, &afile);
-    if (-1 == res) janet_panicv(janet_cstringv(strerror(errno)));
+    if (-1 == res) janet_panicv(janet_cstringv(janet_strerror(errno)));
     do {
         if (strcmp(".", afile.name) && strcmp("..", afile.name)) {
             janet_array_push(paths, janet_cstringv(afile.name));
@@ -1994,8 +2418,18 @@ JANET_CORE_FN(os_dir,
     /* Read directory items with opendir / readdir / closedir */
     struct dirent *dp;
     DIR *dfd = opendir(dir);
-    if (dfd == NULL) janet_panicf("cannot open directory %s", dir);
-    while ((dp = readdir(dfd)) != NULL) {
+    if (dfd == NULL) janet_panicf("cannot open directory %s: %s", dir, janet_strerror(errno));
+    for (;;) {
+        errno = 0;
+        dp = readdir(dfd);
+        if (dp == NULL) {
+            if (errno) {
+                int olderr = errno;
+                closedir(dfd);
+                janet_panicf("failed to read directory %s: %s", dir, janet_strerror(olderr));
+            }
+            break;
+        }
         if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) {
             continue;
         }
@@ -2015,7 +2449,7 @@ JANET_CORE_FN(os_rename,
     const char *dest = janet_getcstring(argv, 1);
     int status = rename(src, dest);
     if (status) {
-        janet_panic(strerror(errno));
+        janet_panic(janet_strerror(errno));
     }
     return janet_wrap_nil();
 }
@@ -2035,7 +2469,7 @@ JANET_CORE_FN(os_realpath,
 #else
     char *dest = realpath(src, NULL);
 #endif
-    if (NULL == dest) janet_panicf("%s: %s", strerror(errno), src);
+    if (NULL == dest) janet_panicf("%s: %s", janet_strerror(errno), src);
     Janet ret = janet_cstringv(dest);
     janet_free(dest);
     return ret;
@@ -2241,7 +2675,7 @@ JANET_CORE_FN(os_open,
     } else if (write_flag && !read_flag) {
         open_flags |= O_WRONLY;
     } else {
-        open_flags = O_RDWR;
+        open_flags |= O_RDWR;
     }
 
     do {
@@ -2253,16 +2687,24 @@ JANET_CORE_FN(os_open,
 }
 
 JANET_CORE_FN(os_pipe,
-              "(os/pipe)",
+              "(os/pipe &opt flags)",
               "Create a readable stream and a writable stream that are connected. Returns a two-element "
               "tuple where the first element is a readable stream and the second element is the writable "
-              "stream.") {
+              "stream. `flags` is a keyword set of flags to disable non-blocking settings on the ends of the pipe. "
+              "This may be desired if passing the pipe to a subprocess with `os/spawn`.\n\n"
+              "* :W - sets the writable end of the pipe to a blocking stream.\n"
+              "* :R - sets the readable end of the pipe to a blocking stream.\n\n"
+              "By default, both ends of the pipe are non-blocking for use with the `ev` module.") {
     (void) argv;
-    janet_fixarity(argc, 0);
+    janet_arity(argc, 0, 1);
     JanetHandle fds[2];
-    if (janet_make_pipe(fds, 0)) janet_panicv(janet_ev_lasterr());
-    JanetStream *reader = janet_stream(fds[0], JANET_STREAM_READABLE, NULL);
-    JanetStream *writer = janet_stream(fds[1], JANET_STREAM_WRITABLE, NULL);
+    int flags = 0;
+    if (argc > 0 && !janet_checktype(argv[0], JANET_NIL)) {
+        flags = (int) janet_getflags(argv, 0, "WR");
+    }
+    if (janet_make_pipe(fds, flags)) janet_panicv(janet_ev_lasterr());
+    JanetStream *reader = janet_stream(fds[0], (flags & 2) ? 0 : JANET_STREAM_READABLE, NULL);
+    JanetStream *writer = janet_stream(fds[1], (flags & 1) ? 0 : JANET_STREAM_WRITABLE, NULL);
     Janet tup[2] = {janet_wrap_abstract(reader), janet_wrap_abstract(writer)};
     return janet_wrap_tuple(janet_tuple_n(tup, 2));
 }
@@ -2306,7 +2748,10 @@ void janet_lib_os(JanetTable *env) {
         JANET_CORE_REG("os/mktime", os_mktime),
         JANET_CORE_REG("os/time", os_time), /* not high resolution */
         JANET_CORE_REG("os/date", os_date), /* not high resolution */
+        JANET_CORE_REG("os/strftime", os_strftime),
         JANET_CORE_REG("os/sleep", os_sleep),
+        JANET_CORE_REG("os/isatty", os_isatty),
+        JANET_CORE_REG("os/setlocale", os_setlocale),
 
         /* env functions */
         JANET_CORE_REG("os/environ", os_environ),
@@ -2343,6 +2788,8 @@ void janet_lib_os(JanetTable *env) {
         JANET_CORE_REG("os/execute", os_execute),
         JANET_CORE_REG("os/spawn", os_spawn),
         JANET_CORE_REG("os/shell", os_shell),
+        JANET_CORE_REG("os/posix-fork", os_posix_fork),
+        JANET_CORE_REG("os/posix-exec", os_posix_exec),
         /* no need to sandbox process management if you can't create processes
          * (allows for limited functionality if use exposes C-functions to create specific processes) */
         JANET_CORE_REG("os/proc-wait", os_proc_wait),
@@ -2356,6 +2803,7 @@ void janet_lib_os(JanetTable *env) {
 #ifdef JANET_EV
         JANET_CORE_REG("os/open", os_open), /* fs read and write */
         JANET_CORE_REG("os/pipe", os_pipe),
+        JANET_CORE_REG("os/sigaction", os_sigaction),
 #endif
 #endif
         JANET_REG_END

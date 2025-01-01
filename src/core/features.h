@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -26,14 +26,19 @@
 #define JANET_FEATURES_H_defined
 
 #if defined(__NetBSD__) || defined(__APPLE__) || defined(__OpenBSD__) \
-    || defined(__bsdi__) || defined(__DragonFly__)
+    || defined(__bsdi__) || defined(__DragonFly__) || defined(__FreeBSD__)
 /* Use BSD source on any BSD systems, include OSX */
 # define _BSD_SOURCE
+# define _POSIX_C_SOURCE 200809L
 #else
 /* Use POSIX feature flags */
 # ifndef _POSIX_C_SOURCE
 # define _POSIX_C_SOURCE 200809L
 # endif
+#endif
+
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
 #endif
 
 /* Needed for sched.h for cpu count */
@@ -43,6 +48,11 @@
 
 #if defined(WIN32) || defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#endif
+
+/* needed for inet_pton and InitializeSRWLock */
+#ifdef __MINGW32__
+#define _WIN32_WINNT _WIN32_WINNT_VISTA
 #endif
 
 /* Needed for realpath on linux, as well as pthread rwlocks. */
@@ -60,5 +70,12 @@
 #if !defined(_NETBSD_SOURCE) && defined(__NetBSD__)
 #define _NETBSD_SOURCE
 #endif
+
+/* Needed for several things when building with -std=c99. */
+#if !__BSD_VISIBLE && (defined(__DragonFly__) || defined(__FreeBSD__))
+#define __BSD_VISIBLE 1
+#endif
+
+#define _FILE_OFFSET_BITS 64
 
 #endif

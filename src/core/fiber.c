@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -39,8 +39,10 @@ static void fiber_reset(JanetFiber *fiber) {
     fiber->env = NULL;
     fiber->last_value = janet_wrap_nil();
 #ifdef JANET_EV
-    fiber->waiting = NULL;
     fiber->sched_id = 0;
+    fiber->ev_callback = NULL;
+    fiber->ev_state = NULL;
+    fiber->ev_stream = NULL;
     fiber->supervisor_channel = NULL;
 #endif
     janet_fiber_set_status(fiber, JANET_STATUS_NEW);
@@ -81,10 +83,10 @@ JanetFiber *janet_fiber_reset(JanetFiber *fiber, JanetFunction *callee, int32_t 
         }
         fiber->stacktop = newstacktop;
     }
+    /* Don't panic on failure since we use this to implement janet_pcall */
     if (janet_fiber_funcframe(fiber, callee)) return NULL;
     janet_fiber_frame(fiber)->flags |= JANET_STACKFRAME_ENTRANCE;
 #ifdef JANET_EV
-    fiber->waiting = NULL;
     fiber->supervisor_channel = NULL;
 #endif
     return fiber;
@@ -237,8 +239,8 @@ int janet_fiber_funcframe(JanetFiber *fiber, JanetFunction *func) {
                                          fiber->data + tuplehead,
                                          oldtop - tuplehead)
                                      : janet_wrap_tuple(janet_tuple_n(
-                                                 fiber->data + tuplehead,
-                                                 oldtop - tuplehead));
+                                             fiber->data + tuplehead,
+                                             oldtop - tuplehead));
         }
     }
 
@@ -368,8 +370,8 @@ int janet_fiber_funcframe_tail(JanetFiber *fiber, JanetFunction *func) {
                                          fiber->data + tuplehead,
                                          fiber->stacktop - tuplehead)
                                      : janet_wrap_tuple(janet_tuple_n(
-                                                 fiber->data + tuplehead,
-                                                 fiber->stacktop - tuplehead));
+                                             fiber->data + tuplehead,
+                                             fiber->stacktop - tuplehead));
         }
         stacksize = tuplehead - fiber->stackstart + 1;
     } else {
@@ -477,10 +479,10 @@ JANET_CORE_FN(cfun_fiber_setenv,
 }
 
 JANET_CORE_FN(cfun_fiber_new,
-              "(fiber/new func &opt sigmask)",
+              "(fiber/new func &opt sigmask env)",
               "Create a new fiber with function body func. Can optionally "
-              "take a set of signals to block from the current parent fiber "
-              "when called. The mask is specified as a keyword where each character "
+              "take a set of signals `sigmask` to capture from child fibers, "
+              "and an environment table `env`. The mask is specified as a keyword where each character "
               "is used to indicate a signal to block. If the ev module is enabled, and "
               "this fiber is used as an argument to `ev/go`, these \"blocked\" signals "
               "will result in messages being sent to the supervisor channel. "
@@ -495,19 +497,25 @@ JANET_CORE_FN(cfun_fiber_new,
               "* :t - block termination signals: error + user[0-4]\n"
               "* :u - block user signals\n"
               "* :y - block yield signals\n"
+              "* :w - block await signals (user9)\n"
+              "* :r - block interrupt signals (user8)\n"
               "* :0-9 - block a specific user signal\n\n"
               "The sigmask argument also can take environment flags. If any mutually "
               "exclusive flags are present, the last flag takes precedence.\n\n"
               "* :i - inherit the environment from the current fiber\n"
               "* :p - the environment table's prototype is the current environment table") {
-    janet_arity(argc, 1, 2);
+    janet_arity(argc, 1, 3);
     JanetFunction *func = janet_getfunction(argv, 0);
     JanetFiber *fiber;
     if (func->def->min_arity > 1) {
         janet_panicf("fiber function must accept 0 or 1 arguments");
     }
     fiber = janet_fiber(func, 64, func->def->min_arity, NULL);
-    if (argc == 2) {
+    janet_assert(fiber != NULL, "bad fiber arity check");
+    if (argc == 3 && !janet_checktype(argv[2], JANET_NIL)) {
+        fiber->env = janet_gettable(argv, 2);
+    }
+    if (argc >= 2) {
         int32_t i;
         JanetByteView view = janet_getbytes(argv, 1);
         fiber->flags = JANET_FIBER_RESUME_NO_USEVAL | JANET_FIBER_RESUME_NO_SKIP;
@@ -518,7 +526,7 @@ JANET_CORE_FN(cfun_fiber_new,
             } else {
                 switch (view.bytes[i]) {
                     default:
-                        janet_panicf("invalid flag %c, expected a, t, d, e, u, y, i, or p", view.bytes[i]);
+                        janet_panicf("invalid flag %c, expected a, t, d, e, u, y, w, r, i, or p", view.bytes[i]);
                         break;
                     case 'a':
                         fiber->flags |=
@@ -548,6 +556,12 @@ JANET_CORE_FN(cfun_fiber_new,
                     case 'y':
                         fiber->flags |= JANET_FIBER_MASK_YIELD;
                         break;
+                    case 'w':
+                        fiber->flags |= JANET_FIBER_MASK_USER9;
+                        break;
+                    case 'r':
+                        fiber->flags |= JANET_FIBER_MASK_USER8;
+                        break;
                     case 'i':
                         if (!janet_vm.fiber->env) {
                             janet_vm.fiber->env = janet_table(0);
@@ -575,7 +589,9 @@ JANET_CORE_FN(cfun_fiber_status,
               "* :error - the fiber has errored out\n"
               "* :debug - the fiber is suspended in debug mode\n"
               "* :pending - the fiber has been yielded\n"
-              "* :user(0-9) - the fiber is suspended by a user signal\n"
+              "* :user(0-7) - the fiber is suspended by a user signal\n"
+              "* :interrupted - the fiber was interrupted\n"
+              "* :suspended - the fiber is waiting to be resumed by the scheduler\n"
               "* :alive - the fiber is currently running and cannot be resumed\n"
               "* :new - the fiber has just been created and not yet run") {
     janet_fixarity(argc, 1);
@@ -625,11 +641,7 @@ JANET_CORE_FN(cfun_fiber_setmaxstack,
     return argv[0];
 }
 
-JANET_CORE_FN(cfun_fiber_can_resume,
-              "(fiber/can-resume? fiber)",
-              "Check if a fiber is finished and cannot be resumed.") {
-    janet_fixarity(argc, 1);
-    JanetFiber *fiber = janet_getfiber(argv, 0);
+int janet_fiber_can_resume(JanetFiber *fiber) {
     JanetFiberStatus s = janet_fiber_status(fiber);
     int isFinished = s == JANET_STATUS_DEAD ||
                      s == JANET_STATUS_ERROR ||
@@ -638,11 +650,19 @@ JANET_CORE_FN(cfun_fiber_can_resume,
                      s == JANET_STATUS_USER2 ||
                      s == JANET_STATUS_USER3 ||
                      s == JANET_STATUS_USER4;
-    return janet_wrap_boolean(!isFinished);
+    return !isFinished;
+}
+
+JANET_CORE_FN(cfun_fiber_can_resume,
+              "(fiber/can-resume? fiber)",
+              "Check if a fiber is finished and cannot be resumed.") {
+    janet_fixarity(argc, 1);
+    JanetFiber *fiber = janet_getfiber(argv, 0);
+    return janet_wrap_boolean(janet_fiber_can_resume(fiber));
 }
 
 JANET_CORE_FN(cfun_fiber_last_value,
-              "(fiber/last-value)",
+              "(fiber/last-value fiber)",
               "Get the last value returned or signaled from the fiber.") {
     janet_fixarity(argc, 1);
     JanetFiber *fiber = janet_getfiber(argv, 0);

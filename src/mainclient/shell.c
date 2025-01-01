@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -147,8 +147,11 @@ static void setup_console_output(void) {
     DWORD dwMode = 0;
     GetConsoleMode(hOut, &dwMode);
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    dwMode |= ENABLE_PROCESSED_OUTPUT;
     SetConsoleMode(hOut, dwMode);
-    SetConsoleOutputCP(65001);
+    if (IsValidCodePage(65001)) {
+        SetConsoleOutputCP(65001);
+    }
 }
 
 /* Ansi terminal raw mode */
@@ -499,10 +502,10 @@ static void kright(void) {
 }
 
 static void krightw(void) {
-    while (gbl_pos != gbl_len && !isspace(gbl_buf[gbl_pos])) {
+    while (gbl_pos != gbl_len && isspace(gbl_buf[gbl_pos])) {
         gbl_pos++;
     }
-    while (gbl_pos != gbl_len && isspace(gbl_buf[gbl_pos])) {
+    while (gbl_pos != gbl_len && !isspace(gbl_buf[gbl_pos])) {
         gbl_pos++;
     }
     refresh();
@@ -544,7 +547,6 @@ static void kdeletew(void) {
     }
     refresh();
 }
-
 
 /* See tools/symchargen.c */
 static int is_symbol_char_gen(uint8_t c) {
@@ -865,7 +867,7 @@ static int line() {
     if (write_console((char *) gbl_prompt, gbl_plen) == -1) return -1;
     for (;;) {
         char c;
-        char seq[3];
+        char seq[5];
 
         int rc;
         do {
@@ -988,6 +990,20 @@ static int line() {
                                     break;
                                 default:
                                     break;
+                            }
+                        } else if (seq[2] == ';') {
+                            if (read_console(seq + 3, 2) == -1) break;
+                            if (seq[3] == '5') {
+                                switch (seq[4]) {
+                                    case 'C': /* ctrl-right */
+                                        krightw();
+                                        break;
+                                    case 'D': /* ctrl-left */
+                                        kleftw();
+                                        break;
+                                    default:
+                                        break;
+                                }
                             }
                         }
                     } else if (seq[0] == 'O') {
@@ -1161,6 +1177,7 @@ int main(int argc, char **argv) {
     janet_resolve(env, janet_csymbol("cli-main"), &mainfun);
     Janet mainargs[1] = { janet_wrap_array(args) };
     JanetFiber *fiber = janet_fiber(janet_unwrap_function(mainfun), 64, 1, mainargs);
+    janet_gcroot(janet_wrap_fiber(fiber));
     fiber->env = env;
 
     /* Run the fiber in an event loop */

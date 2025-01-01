@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -26,6 +26,8 @@
 #include "regalloc.h"
 #include "util.h"
 #endif
+
+/* The JanetRegisterAllocator is really just a bitset. */
 
 void janetc_regalloc_init(JanetcRegisterAllocator *ra) {
     ra->chunks = NULL;
@@ -137,6 +139,14 @@ void janetc_regalloc_free(JanetcRegisterAllocator *ra, int32_t reg) {
     int32_t chunk = reg >> 5;
     int32_t bit = reg & 0x1F;
     ra->chunks[chunk] &= ~ithbit(bit);
+}
+
+/* Check if a register is set. */
+int janetc_regalloc_check(JanetcRegisterAllocator *ra, int32_t reg) {
+    int32_t chunk = reg >> 5;
+    int32_t bit = reg & 0x1F;
+    while (chunk >= ra->count) pushchunk(ra);
+    return !!(ra->chunks[chunk] & ithbit(bit));
 }
 
 /* Get a register that will fit in 8 bits (< 256). Do not call this

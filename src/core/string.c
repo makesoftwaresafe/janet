@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -71,10 +71,10 @@ int janet_string_compare(const uint8_t *lhs, const uint8_t *rhs) {
 int janet_string_equalconst(const uint8_t *lhs, const uint8_t *rhs, int32_t rlen, int32_t rhash) {
     int32_t lhash = janet_string_hash(lhs);
     int32_t llen = janet_string_length(lhs);
-    if (lhs == rhs)
-        return 1;
     if (lhash != rhash || llen != rlen)
         return 0;
+    if (lhs == rhs)
+        return 1;
     return !memcmp(lhs, rhs, rlen);
 }
 
@@ -175,8 +175,9 @@ JANET_CORE_FN(cfun_string_slice,
               "Returns a substring from a byte sequence. The substring is from "
               "index `start` inclusive to index `end`, exclusive. All indexing "
               "is from 0. `start` and `end` can also be negative to indicate indexing "
-              "from the end of the string. Note that index -1 is synonymous with "
-              "index `(length bytes)` to allow a full negative slice range. ") {
+              "from the end of the string. Note that if `start` is negative it is "
+              "exclusive, and if `end` is negative it is inclusive, to allow a full "
+              "negative slice range.") {
     JanetByteView view = janet_getbytes(argv, 0);
     JanetRange range = janet_getslice(argc, argv);
     return janet_stringv(view.bytes + range.start, range.end - range.start);
@@ -364,14 +365,13 @@ JANET_CORE_FN(cfun_string_findall,
 
 struct replace_state {
     struct kmp_state kmp;
-    const uint8_t *subst;
-    int32_t substlen;
+    Janet subst;
 };
 
 static void replacesetup(int32_t argc, Janet *argv, struct replace_state *s) {
     janet_arity(argc, 3, 4);
     JanetByteView pat = janet_getbytes(argv, 0);
-    JanetByteView subst = janet_getbytes(argv, 1);
+    Janet subst = argv[1];
     JanetByteView text = janet_getbytes(argv, 2);
     int32_t start = 0;
     if (argc == 4) {
@@ -380,13 +380,14 @@ static void replacesetup(int32_t argc, Janet *argv, struct replace_state *s) {
     }
     kmp_init(&s->kmp, text.bytes, text.len, pat.bytes, pat.len);
     s->kmp.i = start;
-    s->subst = subst.bytes;
-    s->substlen = subst.len;
+    s->subst = subst;
 }
 
 JANET_CORE_FN(cfun_string_replace,
               "(string/replace patt subst str)",
               "Replace the first occurrence of `patt` with `subst` in the string `str`. "
+              "If `subst` is a function, it will be called with `patt` only if a match is found, "
+              "and should return the actual replacement text to use. "
               "Will return the new string if `patt` is found, otherwise returns `str`.") {
     int32_t result;
     struct replace_state s;
@@ -397,10 +398,11 @@ JANET_CORE_FN(cfun_string_replace,
         kmp_deinit(&s.kmp);
         return janet_stringv(s.kmp.text, s.kmp.textlen);
     }
-    buf = janet_string_begin(s.kmp.textlen - s.kmp.patlen + s.substlen);
+    JanetByteView subst = janet_text_substitution(&s.subst, s.kmp.text + result, s.kmp.patlen, NULL);
+    buf = janet_string_begin(s.kmp.textlen - s.kmp.patlen + subst.len);
     safe_memcpy(buf, s.kmp.text, result);
-    safe_memcpy(buf + result, s.subst, s.substlen);
-    safe_memcpy(buf + result + s.substlen,
+    safe_memcpy(buf + result, subst.bytes, subst.len);
+    safe_memcpy(buf + result + subst.len,
                 s.kmp.text + result + s.kmp.patlen,
                 s.kmp.textlen - result - s.kmp.patlen);
     kmp_deinit(&s.kmp);
@@ -411,6 +413,8 @@ JANET_CORE_FN(cfun_string_replaceall,
               "(string/replace-all patt subst str)",
               "Replace all instances of `patt` with `subst` in the string `str`. Overlapping "
               "matches will not be counted, only the first match in such a span will be replaced. "
+              "If `subst` is a function, it will be called with `patt` once for each match, "
+              "and should return the actual replacement text to use. "
               "Will return the new string if `patt` is found, otherwise returns `str`.") {
     int32_t result;
     struct replace_state s;
@@ -419,8 +423,9 @@ JANET_CORE_FN(cfun_string_replaceall,
     replacesetup(argc, argv, &s);
     janet_buffer_init(&b, s.kmp.textlen);
     while ((result = kmp_next(&s.kmp)) >= 0) {
+        JanetByteView subst = janet_text_substitution(&s.subst, s.kmp.text + result, s.kmp.patlen, NULL);
         janet_buffer_push_bytes(&b, s.kmp.text + lastindex, result - lastindex);
-        janet_buffer_push_bytes(&b, s.subst, s.substlen);
+        janet_buffer_push_bytes(&b, subst.bytes, subst.len);
         lastindex = result + s.kmp.patlen;
         kmp_seti(&s.kmp, lastindex);
     }
@@ -531,7 +536,30 @@ JANET_CORE_FN(cfun_string_join,
 JANET_CORE_FN(cfun_string_format,
               "(string/format format & values)",
               "Similar to C's `snprintf`, but specialized for operating with Janet values. Returns "
-              "a new string.") {
+              "a new string.\n\n"
+              "The following conversion specifiers are supported, where the upper case specifiers generate "
+              "upper case output:\n"
+              "- `c`: ASCII character.\n"
+              "- `d`, `i`: integer, formatted as a decimal number.\n"
+              "- `x`, `X`: integer, formatted as a hexadecimal number.\n"
+              "- `o`: integer, formatted as an octal number.\n"
+              "- `f`, `F`: floating point number, formatted as a decimal number.\n"
+              "- `e`, `E`: floating point number, formatted in scientific notation.\n"
+              "- `g`, `G`: floating point number, formatted in its shortest form.\n"
+              "- `a`, `A`: floating point number, formatted as a hexadecimal number.\n"
+              "- `s`: formatted as a string, precision indicates padding and maximum length.\n"
+              "- `t`: emit the type of the given value.\n"
+              "- `v`: format with (describe x)\n"
+              "- `V`: format with (string x)\n"
+              "- `j`: format to jdn (Janet data notation).\n"
+              "\n"
+              "The following conversion specifiers are used for \"pretty-printing\", where the upper-case "
+              "variants generate colored output. These specifiers can take a precision "
+              "argument to specify the maximum nesting depth to print.\n"
+              "- `p`, `P`: pretty format, truncating if necessary\n"
+              "- `m`, `M`: pretty format without truncating.\n"
+              "- `q`, `Q`: pretty format on one line, truncating if necessary.\n"
+              "- `n`, `N`: pretty format on one line without truncation.\n") {
     janet_arity(argc, 1, -1);
     JanetBuffer *buffer = janet_buffer(0);
     const char *strfrmt = (const char *) janet_getstring(argv, 0);

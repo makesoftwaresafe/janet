@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -31,6 +31,7 @@
 
 #ifndef JANET_WINDOWS
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -40,6 +41,11 @@ static int io_file_get(void *p, Janet key, Janet *out);
 static void io_file_marshal(void *p, JanetMarshalContext *ctx);
 static void *io_file_unmarshal(JanetMarshalContext *ctx);
 static Janet io_file_next(void *p, Janet key);
+
+#ifdef JANET_WINDOWS
+#define ftell _ftelli64
+#define fseek _fseeki64
+#endif
 
 const JanetAbstractType janet_file_type = {
     "core/file",
@@ -120,18 +126,18 @@ JANET_CORE_FN(cfun_io_temp,
               "(file/temp)",
               "Open an anonymous temporary file that is removed on close. "
               "Raises an error on failure.") {
-    janet_sandbox_assert(JANET_SANDBOX_FS_WRITE);
+    janet_sandbox_assert(JANET_SANDBOX_FS_TEMP);
     (void)argv;
     janet_fixarity(argc, 0);
     // XXX use mkostemp when we can to avoid CLOEXEC race.
     FILE *tmp = tmpfile();
     if (!tmp)
-        janet_panicf("unable to create temporary file - %s", strerror(errno));
+        janet_panicf("unable to create temporary file - %s", janet_strerror(errno));
     return janet_makefile(tmp, JANET_FILE_WRITE | JANET_FILE_READ | JANET_FILE_BINARY);
 }
 
 JANET_CORE_FN(cfun_io_fopen,
-              "(file/open path &opt mode)",
+              "(file/open path &opt mode buffer-size)",
               "Open a file. `path` is an absolute or relative path, and "
               "`mode` is a set of flags indicating the mode to open the file in. "
               "`mode` is a keyword where each character represents a flag. If the file "
@@ -143,8 +149,9 @@ JANET_CORE_FN(cfun_io_fopen,
               "Following one of the initial flags, 0 or more of the following flags can be appended:\n\n"
               "* b - open the file in binary mode (rather than text mode)\n\n"
               "* + - append to the file instead of overwriting it\n\n"
-              "* n - error if the file cannot be opened instead of returning nil") {
-    janet_arity(argc, 1, 2);
+              "* n - error if the file cannot be opened instead of returning nil\n\n"
+              "See fopen (<stdio.h>, C99) for further details.") {
+    janet_arity(argc, 1, 3);
     const uint8_t *fname = janet_getstring(argv, 0);
     const uint8_t *fmode;
     int32_t flags;
@@ -157,8 +164,25 @@ JANET_CORE_FN(cfun_io_fopen,
         flags = JANET_FILE_READ;
     }
     FILE *f = fopen((const char *)fname, (const char *)fmode);
+    if (f != NULL) {
+#ifndef JANET_WINDOWS
+        struct stat st;
+        fstat(fileno(f), &st);
+        if (S_ISDIR(st.st_mode)) {
+            fclose(f);
+            janet_panicf("cannot open directory: %s", fname);
+        }
+#endif
+        size_t bufsize = janet_optsize(argv, argc, 2, BUFSIZ);
+        if (bufsize != BUFSIZ) {
+            int result = setvbuf(f, NULL, bufsize ? _IOFBF : _IONBF, bufsize);
+            if (result) {
+                janet_panic("failed to set buffer size for file");
+            }
+        }
+    }
     return f ? janet_makefile(f, flags)
-           : (flags & JANET_FILE_NONIL) ? (janet_panicf("failed to open file %s: %s", fname, strerror(errno)), janet_wrap_nil())
+           : (flags & JANET_FILE_NONIL) ? (janet_panicf("failed to open file %s: %s", fname, janet_strerror(errno)), janet_wrap_nil())
            : janet_wrap_nil();
 }
 
@@ -279,7 +303,7 @@ int janet_file_close(JanetFile *file) {
     if (!(file->flags & (JANET_FILE_NOT_CLOSEABLE | JANET_FILE_CLOSED))) {
         ret = fclose(file->file);
         file->flags |= JANET_FILE_CLOSED;
-        file->file = NULL; /* NULL derefence is easier to debug then other problems */
+        file->file = NULL; /* NULL dereference is easier to debug then other problems */
         return ret;
     }
     return 0;
@@ -327,7 +351,7 @@ JANET_CORE_FN(cfun_io_fseek,
     JanetFile *iof = janet_getabstract(argv, 0, &janet_file_type);
     if (iof->flags & JANET_FILE_CLOSED)
         janet_panic("file is closed");
-    long int offset = 0;
+    int64_t offset = 0;
     int whence = SEEK_CUR;
     if (argc >= 2) {
         const uint8_t *whence_sym = janet_getkeyword(argv, 1);
@@ -341,11 +365,23 @@ JANET_CORE_FN(cfun_io_fseek,
             janet_panicf("expected one of :cur, :set, :end, got %v", argv[1]);
         }
         if (argc == 3) {
-            offset = (long) janet_getinteger64(argv, 2);
+            offset = (int64_t) janet_getinteger64(argv, 2);
         }
     }
     if (fseek(iof->file, offset, whence)) janet_panic("error seeking file");
     return argv[0];
+}
+
+JANET_CORE_FN(cfun_io_ftell,
+              "(file/tell f)",
+              "Get the current value of the file position for file `f`.") {
+    janet_fixarity(argc, 1);
+    JanetFile *iof = janet_getabstract(argv, 0, &janet_file_type);
+    if (iof->flags & JANET_FILE_CLOSED)
+        janet_panic("file is closed");
+    int64_t pos = ftell(iof->file);
+    if (pos == -1) janet_panic("error getting position in file");
+    return janet_wrap_number((double)pos);
 }
 
 static JanetMethod io_file_methods[] = {
@@ -353,6 +389,7 @@ static JanetMethod io_file_methods[] = {
     {"flush", cfun_io_fflush},
     {"read", cfun_io_fread},
     {"seek", cfun_io_fseek},
+    {"tell", cfun_io_ftell},
     {"write", cfun_io_fwrite},
     {NULL, NULL}
 };
@@ -490,7 +527,6 @@ static Janet cfun_io_print_impl_x(int32_t argc, Janet *argv, int newline,
         putc('\n', f);
     return janet_wrap_nil();
 }
-
 
 static Janet cfun_io_print_impl(int32_t argc, Janet *argv,
                                 int newline, const char *name, FILE *dflt_file) {
@@ -783,6 +819,7 @@ void janet_lib_io(JanetTable *env) {
         JANET_CORE_REG("file/write", cfun_io_fwrite),
         JANET_CORE_REG("file/flush", cfun_io_fflush),
         JANET_CORE_REG("file/seek", cfun_io_fseek),
+        JANET_CORE_REG("file/tell", cfun_io_ftell),
         JANET_REG_END
     };
     janet_core_cfuns_ext(env, NULL, io_cfuns);

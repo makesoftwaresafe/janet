@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -69,6 +69,7 @@ typedef enum {
 #define JANET_FUN_REMAINDER 30
 #define JANET_FUN_CMP 31
 #define JANET_FUN_CANCEL 32
+#define JANET_FUN_DIVIDE_FLOOR 33
 
 /* Compiler typedefs */
 typedef struct JanetCompiler JanetCompiler;
@@ -187,6 +188,7 @@ struct JanetCompiler {
 #define JANET_FOPTS_TAIL 0x10000
 #define JANET_FOPTS_HINT 0x20000
 #define JANET_FOPTS_DROP 0x40000
+#define JANET_FOPTS_ACCEPT_SPLICE 0x80000
 
 /* Options for compiling a single form */
 struct JanetFopts {
@@ -260,10 +262,14 @@ void janetc_popscope(JanetCompiler *c);
 void janetc_popscope_keepslot(JanetCompiler *c, JanetSlot retslot);
 JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c);
 
-/* Create a destory slots */
+/* Create a destroy slot */
 JanetSlot janetc_cslot(Janet x);
 
 /* Search for a symbol */
 JanetSlot janetc_resolve(JanetCompiler *c, const uint8_t *sym);
+
+/* Bytecode optimization */
+void janet_bytecode_movopt(JanetFuncDef *def);
+void janet_bytecode_remove_noops(JanetFuncDef *def);
 
 #endif
