@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -40,7 +40,7 @@ void *janet_v_grow(void *v, int32_t increment, int32_t itemsize) {
 
 /* Convert a buffer to normal allocated memory (forget capacity) */
 void *janet_v_flattenmem(void *v, int32_t itemsize) {
-    int32_t *p;
+    char *p;
     if (NULL == v) return NULL;
     size_t size = (size_t) itemsize * janet_v__cnt(v);
     p = janet_malloc(size);

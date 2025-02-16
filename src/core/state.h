@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -23,6 +23,7 @@
 #ifndef JANET_STATE_H_defined
 #define JANET_STATE_H_defined
 
+#include <janet.h>
 #include <stdint.h>
 
 #ifdef JANET_EV
@@ -88,7 +89,7 @@ struct JanetVM {
 
     /* If this flag is true, suspend on function calls and backwards jumps.
      * When this occurs, this flag will be reset to 0. */
-    int auto_suspend;
+    volatile JanetAtomicInt auto_suspend;
 
     /* The current running fiber on the current thread.
      * Set and unset by functions in vm.c */
@@ -99,6 +100,7 @@ struct JanetVM {
      * return point for panics. */
     jmp_buf *signal_buf;
     Janet *return_reg;
+    int coerce_error;
 
     /* The global registry for c functions. Used to store meta-data
      * along with otherwise bare c function pointers. */
@@ -120,10 +122,12 @@ struct JanetVM {
 
     /* Garbage collection */
     void *blocks;
+    void *weak_blocks;
     size_t gc_interval;
     size_t next_collection;
     size_t block_count;
     int gc_suspend;
+    int gc_mark_phase;
 
     /* GC roots */
     Janet *roots;
@@ -146,6 +150,11 @@ struct JanetVM {
     JanetTraversalNode *traversal_top;
     JanetTraversalNode *traversal_base;
 
+    /* Thread safe strerror error buffer - for janet_strerror */
+#ifndef JANET_WINDOWS
+    char strerror_buf[256];
+#endif
+
     /* Event loop and scheduler globals */
 #ifdef JANET_EV
     size_t tq_count;
@@ -153,11 +162,10 @@ struct JanetVM {
     JanetQueue spawn;
     JanetTimeout *tq;
     JanetRNG ev_rng;
-    JanetListenerState **listeners;
-    size_t listener_count;
-    size_t listener_cap;
-    size_t extra_listeners;
+    volatile JanetAtomicInt listener_count; /* used in signal handler, must be volatile */
     JanetTable threaded_abstracts; /* All abstract types that can be shared between threads (used in this thread) */
+    JanetTable active_tasks; /* All possibly live task fibers - used just for tracking */
+    JanetTable signal_handlers;
 #ifdef JANET_WINDOWS
     void **iocp;
 #elif defined(JANET_EV_EPOLL)
@@ -173,6 +181,9 @@ struct JanetVM {
     int timer;
     int timer_enabled;
 #else
+    JanetStream **streams;
+    size_t stream_count;
+    size_t stream_capacity;
     pthread_attr_t new_thread_attr;
     JanetHandle selfpipe[2];
     struct pollfd *fds;

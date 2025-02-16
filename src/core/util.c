@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -79,6 +79,7 @@ const char *const janet_type_names[16] = {
     "pointer"
 };
 
+/* Docstring for signal lists these */
 const char *const janet_signal_names[14] = {
     "ok",
     "error",
@@ -92,10 +93,11 @@ const char *const janet_signal_names[14] = {
     "user5",
     "user6",
     "user7",
-    "user8",
-    "user9"
+    "interrupt",
+    "await"
 };
 
+/* Docstring for fiber/status lists these */
 const char *const janet_status_names[16] = {
     "dead",
     "error",
@@ -109,19 +111,26 @@ const char *const janet_status_names[16] = {
     "user5",
     "user6",
     "user7",
-    "user8",
-    "user9",
+    "interrupted",
+    "suspended",
     "new",
     "alive"
 };
 
+uint32_t janet_hash_mix(uint32_t input, uint32_t more) {
+    uint32_t mix1 = (more + 0x9e3779b9 + (input << 6) + (input >> 2));
+    return input ^ (0x9e3779b9 + (mix1 << 6) + (mix1 >> 2));
+}
+
 #ifndef JANET_PRF
 
 int32_t janet_string_calchash(const uint8_t *str, int32_t len) {
+    if (NULL == str || len == 0) return 5381;
     const uint8_t *end = str + len;
     uint32_t hash = 5381;
     while (str < end)
         hash = (hash << 5) + hash + *str++;
+    hash = janet_hash_mix(hash, (uint32_t) len);
     return (int32_t) hash;
 }
 
@@ -236,11 +245,6 @@ int32_t janet_string_calchash(const uint8_t *str, int32_t len) {
 }
 
 #endif
-
-uint32_t janet_hash_mix(uint32_t input, uint32_t more) {
-    uint32_t mix1 = (more + 0x9e3779b9 + (input << 6) + (input >> 2));
-    return input ^ (0x9e3779b9 + (mix1 << 6) + (mix1 >> 2));
-}
 
 /* Computes hash of an array of values */
 int32_t janet_array_calchash(const Janet *array, int32_t len) {
@@ -498,7 +502,7 @@ typedef struct {
 static void namebuf_init(NameBuf *namebuf, const char *prefix) {
     size_t plen = strlen(prefix);
     namebuf->plen = plen;
-    namebuf->buf = janet_malloc(namebuf->plen + 256);
+    namebuf->buf = janet_smalloc(namebuf->plen + 256);
     if (NULL == namebuf->buf) {
         JANET_OUT_OF_MEMORY;
     }
@@ -507,12 +511,12 @@ static void namebuf_init(NameBuf *namebuf, const char *prefix) {
 }
 
 static void namebuf_deinit(NameBuf *namebuf) {
-    janet_free(namebuf->buf);
+    janet_sfree(namebuf->buf);
 }
 
 static char *namebuf_name(NameBuf *namebuf, const char *suffix) {
     size_t slen = strlen(suffix);
-    namebuf->buf = janet_realloc(namebuf->buf, namebuf->plen + 2 + slen);
+    namebuf->buf = janet_srealloc(namebuf->buf, namebuf->plen + 2 + slen);
     if (NULL == namebuf->buf) {
         JANET_OUT_OF_MEMORY;
     }
@@ -662,6 +666,59 @@ JanetBinding janet_binding_from_entry(Janet entry) {
     return binding;
 }
 
+/* If the value at the given address can be coerced to a byte view,
+   return that byte view. If it can't, replace the value at the address
+   with the result of janet_to_string, and return a byte view over that
+   string. */
+static JanetByteView memoize_byte_view(Janet *value) {
+    JanetByteView result;
+    if (!janet_bytes_view(*value, &result.bytes, &result.len)) {
+        JanetString str = janet_to_string(*value);
+        *value = janet_wrap_string(str);
+        result.bytes = str;
+        result.len = janet_string_length(str);
+    }
+    return result;
+}
+
+static JanetByteView to_byte_view(Janet value) {
+    JanetByteView result;
+    if (!janet_bytes_view(value, &result.bytes, &result.len)) {
+        JanetString str = janet_to_string(value);
+        result.bytes = str;
+        result.len = janet_string_length(str);
+    }
+    return result;
+}
+
+JanetByteView janet_text_substitution(
+    Janet *subst,
+    const uint8_t *bytes,
+    uint32_t len,
+    JanetArray *extra_argv) {
+    int32_t extra_argc = extra_argv == NULL ? 0 : extra_argv->count;
+    JanetType type = janet_type(*subst);
+    switch (type) {
+        case JANET_FUNCTION:
+        case JANET_CFUNCTION: {
+            int32_t argc = 1 + extra_argc;
+            Janet *argv = janet_tuple_begin(argc);
+            argv[0] = janet_stringv(bytes, len);
+            for (int32_t i = 0; i < extra_argc; i++) {
+                argv[i + 1] = extra_argv->data[i];
+            }
+            janet_tuple_end(argv);
+            if (type == JANET_FUNCTION) {
+                return to_byte_view(janet_call(janet_unwrap_function(*subst), argc, argv));
+            } else {
+                return to_byte_view(janet_unwrap_cfunction(*subst)(argc, argv));
+            }
+        }
+        default:
+            return memoize_byte_view(subst);
+    }
+}
+
 JanetBinding janet_resolve_ext(JanetTable *env, const uint8_t *sym) {
     Janet entry = janet_table_get(env, janet_wrap_symbol(sym));
     return janet_binding_from_entry(entry);
@@ -751,6 +808,13 @@ int janet_checkint(Janet x) {
     return janet_checkintrange(dval);
 }
 
+int janet_checkuint(Janet x) {
+    if (!janet_checktype(x, JANET_NUMBER))
+        return 0;
+    double dval = janet_unwrap_number(x);
+    return janet_checkuintrange(dval);
+}
+
 int janet_checkint64(Janet x) {
     if (!janet_checktype(x, JANET_NUMBER))
         return 0;
@@ -762,7 +826,21 @@ int janet_checkuint64(Janet x) {
     if (!janet_checktype(x, JANET_NUMBER))
         return 0;
     double dval = janet_unwrap_number(x);
-    return dval >= 0 && dval <= JANET_INTMAX_DOUBLE && dval == (uint64_t) dval;
+    return janet_checkuint64range(dval);
+}
+
+int janet_checkint16(Janet x) {
+    if (!janet_checktype(x, JANET_NUMBER))
+        return 0;
+    double dval = janet_unwrap_number(x);
+    return janet_checkint16range(dval);
+}
+
+int janet_checkuint16(Janet x) {
+    if (!janet_checktype(x, JANET_NUMBER))
+        return 0;
+    double dval = janet_unwrap_number(x);
+    return janet_checkuint16range(dval);
 }
 
 int janet_checksize(Janet x) {
@@ -821,37 +899,90 @@ int32_t janet_sorted_keys(const JanetKV *dict, int32_t cap, int32_t *index_buffe
 /* Clock shims for various platforms */
 #ifdef JANET_GETTIME
 #ifdef JANET_WINDOWS
-int janet_gettime(struct timespec *spec) {
-    FILETIME ftime;
-    GetSystemTimeAsFileTime(&ftime);
-    int64_t wintime = (int64_t)(ftime.dwLowDateTime) | ((int64_t)(ftime.dwHighDateTime) << 32);
-    /* Windows epoch is January 1, 1601 apparently */
-    wintime -= 116444736000000000LL;
-    spec->tv_sec  = wintime / 10000000LL;
-    /* Resolution is 100 nanoseconds. */
-    spec->tv_nsec = wintime % 10000000LL * 100;
+#include <profileapi.h>
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    if (source == JANET_TIME_REALTIME) {
+        FILETIME ftime;
+        GetSystemTimeAsFileTime(&ftime);
+        int64_t wintime = (int64_t)(ftime.dwLowDateTime) | ((int64_t)(ftime.dwHighDateTime) << 32);
+        /* Windows epoch is January 1, 1601 apparently */
+        wintime -= 116444736000000000LL;
+        spec->tv_sec  = wintime / 10000000LL;
+        /* Resolution is 100 nanoseconds. */
+        spec->tv_nsec = wintime % 10000000LL * 100;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        LARGE_INTEGER count;
+        LARGE_INTEGER perf_freq;
+        QueryPerformanceCounter(&count);
+        QueryPerformanceFrequency(&perf_freq);
+        spec->tv_sec = count.QuadPart / perf_freq.QuadPart;
+        spec->tv_nsec = (long)((count.QuadPart % perf_freq.QuadPart) * 1000000000 / perf_freq.QuadPart);
+    } else if (source == JANET_TIME_CPUTIME) {
+        FILETIME creationTime, exitTime, kernelTime, userTime;
+        GetProcessTimes(GetCurrentProcess(), &creationTime, &exitTime, &kernelTime, &userTime);
+        int64_t tmp = ((int64_t)userTime.dwHighDateTime << 32) + userTime.dwLowDateTime;
+        spec->tv_sec = tmp / 10000000LL;
+        spec->tv_nsec = tmp % 10000000LL * 100;
+    }
     return 0;
 }
 /* clock_gettime() wasn't available on Mac until 10.12. */
 #elif defined(JANET_APPLE) && !defined(MAC_OS_X_VERSION_10_12)
 #include <mach/clock.h>
 #include <mach/mach.h>
-int janet_gettime(struct timespec *spec) {
-    clock_serv_t cclock;
-    mach_timespec_t mts;
-    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-    clock_get_time(cclock, &mts);
-    mach_port_deallocate(mach_task_self(), cclock);
-    spec->tv_sec = mts.tv_sec;
-    spec->tv_nsec = mts.tv_nsec;
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    if (source == JANET_TIME_REALTIME) {
+        clock_serv_t cclock;
+        mach_timespec_t mts;
+        host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
+        clock_get_time(cclock, &mts);
+        mach_port_deallocate(mach_task_self(), cclock);
+        spec->tv_sec = mts.tv_sec;
+        spec->tv_nsec = mts.tv_nsec;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        clock_serv_t cclock;
+        int nsecs;
+        mach_msg_type_number_t count;
+        host_get_clock_service(mach_host_self(), clock, &cclock);
+        clock_get_attributes(cclock, CLOCK_GET_TIME_RES, (clock_attr_t)&nsecs, &count);
+        mach_port_deallocate(mach_task_self(), cclock);
+        clock_getres(CLOCK_MONOTONIC, spec);
+    }
+    if (source == JANET_TIME_CPUTIME) {
+        clock_t tmp = clock();
+        spec->tv_sec = tmp;
+        spec->tv_nsec = (tmp - spec->tv_sec) * 1.0e9;
+    }
     return 0;
 }
 #else
-int janet_gettime(struct timespec *spec) {
-    return clock_gettime(CLOCK_REALTIME, spec);
+int janet_gettime(struct timespec *spec, enum JanetTimeSource source) {
+    clockid_t cid = CLOCK_REALTIME;
+    if (source == JANET_TIME_REALTIME) {
+        cid = CLOCK_REALTIME;
+    } else if (source == JANET_TIME_MONOTONIC) {
+        cid = CLOCK_MONOTONIC;
+    } else if (source == JANET_TIME_CPUTIME) {
+        cid = CLOCK_PROCESS_CPUTIME_ID;
+    }
+    return clock_gettime(cid, spec);
 }
 #endif
 #endif
+
+/* Better strerror (thread-safe if available) */
+const char *janet_strerror(int e) {
+#ifdef JANET_WINDOWS
+    /* Microsoft strerror seems sane here and is thread safe by default */
+    return strerror(e);
+#elif defined(__GLIBC__)
+    /* See https://linux.die.net/man/3/strerror_r */
+    return strerror_r(e, janet_vm.strerror_buf, sizeof(janet_vm.strerror_buf));
+#else
+    strerror_r(e, janet_vm.strerror_buf, sizeof(janet_vm.strerror_buf));
+    return janet_vm.strerror_buf;
+#endif
+}
 
 /* Setting C99 standard makes this not available, but it should
  * work/link properly if we detect a BSD */
@@ -860,6 +991,7 @@ void arc4random_buf(void *buf, size_t nbytes);
 #endif
 
 int janet_cryptorand(uint8_t *out, size_t n) {
+#ifndef JANET_NO_CRYPTORAND
 #ifdef JANET_WINDOWS
     for (size_t i = 0; i < n; i += sizeof(unsigned int)) {
         unsigned int v;
@@ -871,7 +1003,10 @@ int janet_cryptorand(uint8_t *out, size_t n) {
         }
     }
     return 0;
-#elif defined(JANET_LINUX) || defined(JANET_CYGWIN) || ( defined(JANET_APPLE) && !defined(MAC_OS_X_VERSION_10_7) )
+#elif defined(JANET_BSD) || defined(MAC_OS_X_VERSION_10_7)
+    arc4random_buf(out, n);
+    return 0;
+#else
     /* We should be able to call getrandom on linux, but it doesn't seem
        to be uniformly supported on linux distros.
        On Mac, arc4random_buf wasn't available on until 10.7.
@@ -893,12 +1028,10 @@ int janet_cryptorand(uint8_t *out, size_t n) {
     }
     RETRY_EINTR(rc, close(randfd));
     return 0;
-#elif defined(JANET_BSD) || defined(MAC_OS_X_VERSION_10_7)
-    arc4random_buf(out, n);
-    return 0;
+#endif
 #else
-    (void) n;
     (void) out;
+    (void) n;
     return -1;
 #endif
 }

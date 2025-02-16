@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -31,6 +31,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <float.h>
 
 /* Implements a pretty printer for Janet. The pretty printer
  * is simple and not that flexible, but fast. */
@@ -38,11 +39,15 @@
 /* Temporary buffer size */
 #define BUFSIZE 64
 
+/* Preprocessor hacks */
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
 static void number_to_string_b(JanetBuffer *buffer, double x) {
     janet_buffer_ensure(buffer, buffer->count + BUFSIZE, 2);
     const char *fmt = (x == floor(x) &&
                        x <= JANET_INTMAX_DOUBLE &&
-                       x >= JANET_INTMIN_DOUBLE) ? "%.0f" : "%g";
+                       x >= JANET_INTMIN_DOUBLE) ? "%.0f" : ("%." STR(DBL_DIG) "g");
     int count;
     if (x == 0.0) {
         /* Prevent printing of '-0' */
@@ -152,6 +157,12 @@ static void janet_escape_string_impl(JanetBuffer *buffer, const uint8_t *str, in
             case '\v':
                 janet_buffer_push_bytes(buffer, (const uint8_t *)"\\v", 2);
                 break;
+            case '\a':
+                janet_buffer_push_bytes(buffer, (const uint8_t *)"\\a", 2);
+                break;
+            case '\b':
+                janet_buffer_push_bytes(buffer, (const uint8_t *)"\\b", 2);
+                break;
             case 27:
                 janet_buffer_push_bytes(buffer, (const uint8_t *)"\\e", 2);
                 break;
@@ -244,6 +255,10 @@ void janet_to_string_b(JanetBuffer *buffer, Janet x) {
         case JANET_FUNCTION: {
             JanetFunction *fun = janet_unwrap_function(x);
             JanetFuncDef *def = fun->def;
+            if (def == NULL) {
+                janet_buffer_push_cstring(buffer, "<incomplete function>");
+                break;
+            }
             if (def->name) {
                 const uint8_t *n = def->name;
                 janet_buffer_push_cstring(buffer, "<function ");
@@ -364,8 +379,10 @@ static int print_jdn_one(struct pretty *S, Janet x, int depth) {
             break;
         case JANET_NUMBER:
             janet_buffer_ensure(S->buffer, S->buffer->count + BUFSIZE, 2);
-            int count = snprintf((char *) S->buffer->data + S->buffer->count, BUFSIZE, "%.17g", janet_unwrap_number(x));
-            S->buffer->count += count;
+            double num = janet_unwrap_number(x);
+            if (isnan(num)) return 1;
+            if (isinf(num)) return 1;
+            janet_buffer_dtostr(S->buffer, num);
             break;
         case JANET_SYMBOL:
         case JANET_KEYWORD:
@@ -637,7 +654,7 @@ static void janet_pretty_one(struct pretty *S, Janet x, int is_dict_value) {
                     }
                 }
 
-                janet_sorted_keys(kvs, cap, S->keysort_buffer + ks_start);
+                janet_sorted_keys(kvs, cap, S->keysort_buffer == NULL ? NULL : S->keysort_buffer + ks_start);
                 S->keysort_start += len;
                 if (!(S->flags & JANET_PRETTY_NOTRUNC) && (len > JANET_PRETTY_DICT_LIMIT)) {
                     len = JANET_PRETTY_DICT_LIMIT;
@@ -736,7 +753,7 @@ static void pushtypes(JanetBuffer *buffer, int types) {
             if (first) {
                 first = 0;
             } else {
-                janet_buffer_push_u8(buffer, '|');
+                janet_buffer_push_cstring(buffer, (types == 1) ? " or " : ", ");
             }
             janet_buffer_push_cstring(buffer, janet_type_names[i]);
         }
@@ -762,6 +779,8 @@ struct FmtMapping {
 /* Janet uses fixed width integer types for most things, so map
  * format specifiers to these fixed sizes */
 static const struct FmtMapping format_mappings[] = {
+    {'D', PRId64},
+    {'I', PRIi64},
     {'d', PRId64},
     {'i', PRIi64},
     {'o', PRIo64},
@@ -775,7 +794,7 @@ static const char *get_fmt_mapping(char c) {
         if (format_mappings[i].c == c)
             return format_mappings[i].mapping;
     }
-    return NULL;
+    janet_assert(0, "bad format mapping");
 }
 
 static const char *scanformat(
@@ -809,10 +828,11 @@ static const char *scanformat(
     *(form++) = '%';
     const char *p2 = strfrmt;
     while (p2 <= p) {
-        if (strchr(FMT_REPLACE_INTTYPES, *p2) != NULL) {
+        char *loc = strchr(FMT_REPLACE_INTTYPES, *p2);
+        if (loc != NULL && *loc != '\0') {
             const char *mapping = get_fmt_mapping(*p2++);
             size_t len = strlen(mapping);
-            strcpy(form, mapping);
+            memcpy(form, mapping, len);
             form += len;
         } else {
             *(form++) = *(p2++);
@@ -839,13 +859,19 @@ void janet_formatbv(JanetBuffer *b, const char *format, va_list args) {
             c = scanformat(c, form, width, precision);
             switch (*c++) {
                 case 'c': {
-                    int n = va_arg(args, long);
+                    int n = va_arg(args, int);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
                 case 'd':
                 case 'i': {
-                    int64_t n = va_arg(args, long);
+                    int64_t n = (int64_t) va_arg(args, int32_t);
+                    nb = snprintf(item, MAX_ITEM, form, n);
+                    break;
+                }
+                case 'D':
+                case 'I': {
+                    int64_t n = va_arg(args, int64_t);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
@@ -853,7 +879,7 @@ void janet_formatbv(JanetBuffer *b, const char *format, va_list args) {
                 case 'X':
                 case 'o':
                 case 'u': {
-                    uint64_t n = va_arg(args, unsigned long);
+                    uint64_t n = va_arg(args, uint64_t);
                     nb = snprintf(item, MAX_ITEM, form, n);
                     break;
                 }
@@ -897,7 +923,7 @@ void janet_formatbv(JanetBuffer *b, const char *format, va_list args) {
                     janet_buffer_push_cstring(b, typestr(va_arg(args, Janet)));
                     break;
                 case 'T': {
-                    int types = va_arg(args, long);
+                    int types = va_arg(args, int);
                     pushtypes(b, types);
                     break;
                 }
@@ -1006,6 +1032,8 @@ void janet_buffer_format(
                                   janet_getinteger(argv, arg));
                     break;
                 }
+                case 'D':
+                case 'I':
                 case 'd':
                 case 'i': {
                     int64_t n = janet_getinteger64(argv, arg);

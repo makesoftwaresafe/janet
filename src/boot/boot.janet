@@ -1,5 +1,5 @@
 # The core janet library
-# Copyright 2023 © Calvin Rose
+# Copyright 2024 © Calvin Rose
 
 ###
 ###
@@ -39,6 +39,7 @@
       (buffer/format buf "%j" (in args index))
       (set index (+ index 1)))
     (array/push modifiers (string buf ")\n\n" docstr))
+    (if (dyn :debug) (array/push modifiers {:source-form (dyn :macro-form)}))
     # Build return value
     ~(def ,name ,;modifiers (fn ,name ,;(tuple/slice more start)))))
 
@@ -103,57 +104,45 @@
 (defn symbol? "Check if x is a symbol." [x] (= (type x) :symbol))
 (defn keyword? "Check if x is a keyword." [x] (= (type x) :keyword))
 (defn buffer? "Check if x is a buffer." [x] (= (type x) :buffer))
-(defn function? "Check if x is a function (not a cfunction)." [x]
-  (= (type x) :function))
+(defn function? "Check if x is a function (not a cfunction)." [x] (= (type x) :function))
 (defn cfunction? "Check if x a cfunction." [x] (= (type x) :cfunction))
 (defn table? "Check if x a table." [x] (= (type x) :table))
 (defn struct? "Check if x a struct." [x] (= (type x) :struct))
 (defn array? "Check if x is an array." [x] (= (type x) :array))
 (defn tuple? "Check if x is a tuple." [x] (= (type x) :tuple))
 (defn boolean? "Check if x is a boolean." [x] (= (type x) :boolean))
-(defn bytes? "Check if x is a string, symbol, keyword, or buffer." [x]
-  (def t (type x))
-  (if (= t :string) true (if (= t :symbol) true (if (= t :keyword) true (= t :buffer)))))
-(defn dictionary? "Check if x is a table or struct." [x]
-  (def t (type x))
-  (if (= t :table) true (= t :struct)))
-(defn indexed? "Check if x is an array or tuple." [x]
-  (def t (type x))
-  (if (= t :array) true (= t :tuple)))
 (defn truthy? "Check if x is truthy." [x] (if x true false))
 (defn true? "Check if x is true." [x] (= x true))
 (defn false? "Check if x is false." [x] (= x false))
 (defn nil? "Check if x is nil." [x] (= x nil))
 (defn empty? "Check if xs is empty." [xs] (= nil (next xs nil)))
 
-# For macros, we define an imcomplete odd? function that will be overriden.
+# For macros, we define an incomplete odd? function that will be overridden.
 (defn odd? [x] (= 1 (mod x 2)))
 
-(def idempotent?
-  ```
-  (idempotent? x)
+(def- non-atomic-types
+  {:array true
+   :tuple true
+   :table true
+   :buffer true
+   :symbol true
+   :struct true})
 
-  Check if x is a value that evaluates to itself when compiled.
-  ```
-  (do
-    (def non-atomic-types
-      {:array true
-       :tuple true
-       :table true
-       :buffer true
-       :struct true})
-    (fn idempotent? [x] (not (in non-atomic-types (type x))))))
+(defn idempotent?
+  "Check if x is a value that evaluates to itself when compiled."
+  [x]
+  (not (in non-atomic-types (type x))))
 
 # C style macros and functions for imperative sugar. No bitwise though.
 (defn inc "Returns x + 1." [x] (+ x 1))
 (defn dec "Returns x - 1." [x] (- x 1))
 (defmacro ++ "Increments the var x by 1." [x] ~(set ,x (,+ ,x ,1)))
 (defmacro -- "Decrements the var x by 1." [x] ~(set ,x (,- ,x ,1)))
-(defmacro += "Increments the var x by n." [x n] ~(set ,x (,+ ,x ,n)))
-(defmacro -= "Decrements the var x by n." [x n] ~(set ,x (,- ,x ,n)))
-(defmacro *= "Shorthand for (set x (\\* x n))." [x n] ~(set ,x (,* ,x ,n)))
-(defmacro /= "Shorthand for (set x (/ x n))." [x n] ~(set ,x (,/ ,x ,n)))
-(defmacro %= "Shorthand for (set x (% x n))." [x n] ~(set ,x (,% ,x ,n)))
+(defmacro += "Increments the var x by n." [x & ns] ~(set ,x (,+ ,x ,;ns)))
+(defmacro -= "Decrements the var x by n." [x & ns] ~(set ,x (,- ,x ,;ns)))
+(defmacro *= "Shorthand for (set x (\\* x n))." [x & ns] ~(set ,x (,* ,x ,;ns)))
+(defmacro /= "Shorthand for (set x (/ x n))." [x & ns] ~(set ,x (,/ ,x ,;ns)))
+(defmacro %= "Shorthand for (set x (% x n))." [x & ns] ~(set ,x (,% ,x ,;ns)))
 
 (defmacro assert
   "Throw an error if x is not truthy. Will not evaluate `err` if x is truthy."
@@ -165,16 +154,71 @@
        ,v
        (,error ,(if err err (string/format "assert failure in %j" x))))))
 
+(defmacro defdyn
+  ``Define an alias for a keyword that is used as a dynamic binding. The
+  alias is a normal, lexically scoped binding that can be used instead of
+  a keyword to prevent typos. `defdyn` does not set dynamic bindings or otherwise
+  replace `dyn` and `setdyn`. The alias _must_ start and end with the `*` character, usually
+  called "earmuffs".``
+  [alias & more]
+  (assert (symbol? alias) "alias must be a symbol")
+  (assert (> (length alias) 2) "name must have leading and trailing '*' characters")
+  (assert (= 42 (get alias 0) (get alias (- (length alias) 1))) "name must have leading and trailing '*' characters")
+  (def prefix (dyn :defdyn-prefix))
+  (def kw (keyword prefix (slice alias 1 -2)))
+  ~(def ,alias :dyn ,;more ,kw))
+
+(defdyn *macro-form*
+  "Inside a macro, is bound to the source form that invoked the macro")
+
+(defdyn *lint-error*
+  "The current lint error level. The error level is the lint level at which compilation will exit with an error and not continue.")
+
+(defdyn *lint-warn*
+  "The current lint warning level. The warning level is the lint level at which and error will be printed but compilation will continue as normal.")
+
+(defdyn *lint-levels*
+  "A table of keyword alias to numbers denoting a lint level. Can be used to provided custom aliases for numeric lint levels.")
+
+(defdyn *macro-lints*
+  ``Bound to an array of lint messages that will be reported by the compiler inside a macro.
+  To indicate an error or warning, a macro author should use `maclintf`.``)
+
+(defn maclintf
+  ``When inside a macro, call this function to add a linter warning. Takes
+  a `fmt` argument like `string/format`, which is used to format the message.``
+  [level fmt & args]
+  (def lints (dyn *macro-lints*))
+  (if lints
+    (do
+      (def form (dyn *macro-form*))
+      (def [l c] (if (tuple? form) (tuple/sourcemap form) [nil nil]))
+      (def l (if (not= -1 l) l))
+      (def c (if (not= -1 c) c))
+      (def msg (string/format fmt ;args))
+      (array/push lints [level l c msg])))
+  nil)
+
 (defn errorf
   "A combination of `error` and `string/format`. Equivalent to `(error (string/format fmt ;args))`."
   [fmt & args]
   (error (string/format fmt ;args)))
 
+(defmacro assertf
+  "Convenience macro that combines `assert` and `string/format`."
+  [x fmt & args]
+  (def v (gensym))
+  ~(do
+     (def ,v ,x)
+     (if ,v
+       ,v
+       (,errorf ,fmt ,;args))))
+
 (defmacro default
   ``Define a default value for an optional argument.
   Expands to `(def sym (if (= nil sym) val sym))`.``
   [sym val]
-  ~(def ,sym (if (= nil ,sym) ,val ,sym)))
+  ~(def ,sym (if (,= nil ,sym) ,val ,sym)))
 
 (defmacro comment
   "Ignores the body of the comment."
@@ -256,7 +300,7 @@
   (let [[[err fib]] catch
         f (gensym)
         r (gensym)]
-    ~(let [,f (,fiber/new (fn [] ,body) :ie)
+    ~(let [,f (,fiber/new (fn :try [] ,body) :ie)
            ,r (,resume ,f)]
        (if (,= (,fiber/status ,f) :error)
          (do (def ,err ,r) ,(if fib ~(def ,fib ,f)) ,;(tuple/slice catch 1))
@@ -268,7 +312,7 @@
   error, and the second is the return value or error.`
   [& body]
   (let [f (gensym) r (gensym)]
-    ~(let [,f (,fiber/new (fn [] ,;body) :ie)
+    ~(let [,f (,fiber/new (fn :protect [] ,;body) :ie)
            ,r (,resume ,f)]
        [(,not= :error (,fiber/status ,f)) ,r])))
 
@@ -282,7 +326,7 @@
   (while (> i 0)
     (-- i)
     (def v (in forms i))
-    (set ret (if (= ret true)
+    (set ret (if (= i (- len 1))
                v
                (if (idempotent? v)
                  ['if v ret v]
@@ -325,7 +369,7 @@
   [form & body]
   (with-syms [f r]
     ~(do
-       (def ,f (,fiber/new (fn [] ,;body) :ti))
+       (def ,f (,fiber/new (fn :defer [] ,;body) :ti))
        (def ,r (,resume ,f))
        ,form
        (if (= (,fiber/status ,f) :dead)
@@ -338,7 +382,7 @@
   [form & body]
   (with-syms [f r]
     ~(do
-       (def ,f (,fiber/new (fn [] ,;body) :ti))
+       (def ,f (,fiber/new (fn :edefer [] ,;body) :ti))
        (def ,r (,resume ,f))
        (if (= (,fiber/status ,f) :dead)
          ,r
@@ -350,7 +394,7 @@
   [tag & body]
   (with-syms [res target payload fib]
     ~(do
-       (def ,fib (,fiber/new (fn [] [,tag (do ,;body)]) :i0))
+       (def ,fib (,fiber/new (fn :prompt [] [,tag (do ,;body)]) :i0))
        (def ,res (,resume ,fib))
        (def [,target ,payload] ,res)
        (if (,= ,tag ,target)
@@ -431,9 +475,15 @@
     (error (string "expected tuple for range, got " x))))
 
 (defn- range-template
-  [binding object rest op comparison]
-  (let [[start stop step] (check-indexed object)]
-    (for-template binding start stop (or step 1) comparison op [rest])))
+  [binding object kind rest op comparison]
+  (check-indexed object)
+  (def [a b c] object)
+  (def [start stop step]
+    (case (length object)
+      1 (case kind :range [0 a 1] :down [a 0 1])
+      2 [a b 1]
+      [a b c]))
+  (for-template binding start stop step comparison op [rest]))
 
 (defn- each-template
   [binding inx kind body]
@@ -447,7 +497,7 @@
            ,(case kind
               :each ~(,in ,ds ,k)
               :keys k
-              :pairs ~(,tuple ,k (,in ,ds ,k))))
+              :pairs ~[,k (,in ,ds ,k)]))
          ,;body
          (set ,k (,next ,ds ,k))))))
 
@@ -483,16 +533,17 @@
           :repeat (with-syms [iter]
                     ~(do (var ,iter ,verb) (while (> ,iter 0) ,rest (-- ,iter))))
           :when ~(when ,verb ,rest)
+          :unless ~(unless ,verb ,rest)
           (error (string "unexpected loop modifier " binding))))))
 
   # 3 term expression
   (def {(+ i 2) object} head)
   (let [rest (loop1 body head (+ i 3))]
     (case verb
-      :range (range-template binding object rest + <)
-      :range-to (range-template binding object rest + <=)
-      :down (range-template binding object rest - >)
-      :down-to (range-template binding object rest - >=)
+      :range (range-template binding object :range rest + <)
+      :range-to (range-template binding object :range rest + <=)
+      :down (range-template binding object :down rest - >)
+      :down-to (range-template binding object :down rest - >=)
       :keys (each-template binding object :keys [rest])
       :pairs (each-template binding object :pairs [rest])
       :in (each-template binding object :each [rest])
@@ -535,6 +586,11 @@
   "Loop over each value in `ds`. Returns nil."
   [x ds & body]
   (each-template x ds :each body))
+
+(defn- check-empty-body
+  [body]
+  (if (= (length body) 0)
+    (maclintf :normal "empty loop body")))
 
 (defmacro loop
   ```
@@ -599,7 +655,10 @@
   * `:repeat n` -- repeats the next inner loop `n` times.
 
   * `:when condition` -- only evaluates the current loop body when `condition`
-    is true.
+    is truthy.
+
+  * `:unless condition` -- only evaluates the current loop body when `condition`
+    is falsey.
 
   The `loop` macro always evaluates to nil.
   ```
@@ -611,7 +670,16 @@
   See `loop` for details.``
   [head & body]
   (def $accum (gensym))
+  (check-empty-body body)
   ~(do (def ,$accum @[]) (loop ,head (,array/push ,$accum (do ,;body))) ,$accum))
+
+(defmacro catseq
+  ``Similar to `loop`, but concatenates each element from the loop body into an array and returns that.
+  See `loop` for details.``
+  [head & body]
+  (def $accum (gensym))
+  (check-empty-body body)
+  ~(do (def ,$accum @[]) (loop ,head (,array/concat ,$accum (do ,;body))) ,$accum))
 
 (defmacro tabseq
   ``Similar to `loop`, but accumulates key value pairs into a table.
@@ -624,17 +692,18 @@
   ``Create a generator expression using the `loop` syntax. Returns a fiber
   that yields all values inside the loop in order. See `loop` for details.``
   [head & body]
-  ~(,fiber/new (fn [] (loop ,head (yield (do ,;body)))) :yi))
+  (check-empty-body body)
+  ~(,fiber/new (fn :generate [] (loop ,head (yield (do ,;body)))) :yi))
 
 (defmacro coro
   "A wrapper for making fibers that may yield multiple values (coroutine). Same as `(fiber/new (fn [] ;body) :yi)`."
   [& body]
-  (tuple fiber/new (tuple 'fn '[] ;body) :yi))
+  (tuple fiber/new (tuple 'fn :coro '[] ;body) :yi))
 
 (defmacro fiber-fn
   "A wrapper for making fibers. Same as `(fiber/new (fn [] ;body) flags)`."
   [flags & body]
-  (tuple fiber/new (tuple 'fn '[] ;body) flags))
+  (tuple fiber/new (tuple 'fn :fiber-fn '[] ;body) flags))
 
 (defn sum
   "Returns the sum of xs. If xs is empty, returns 0."
@@ -646,7 +715,25 @@
 (defn mean
   "Returns the mean of xs. If empty, returns NaN."
   [xs]
-  (/ (sum xs) (length xs)))
+  (if (lengthable? xs)
+    (/ (sum xs) (length xs))
+    (do
+      (var [accum total] [0 0])
+      (each x xs (+= accum x) (++ total))
+      (/ accum total))))
+
+(defn geomean
+  "Returns the geometric mean of xs. If empty, returns NaN."
+  [xs]
+  (if (lengthable? xs)
+    (do
+      (var accum 0)
+      (each x xs (+= accum (math/log x)))
+      (math/exp (/ accum (length xs))))
+    (do
+      (var [accum total] [0 0])
+      (each x xs (+= accum (math/log x)) (++ total))
+      (math/exp (/ accum total)))))
 
 (defn product
   "Returns the product of xs. If xs is empty, returns 1."
@@ -654,6 +741,9 @@
   (var accum 1)
   (each x xs (*= accum x))
   accum)
+
+# declare ahead of time
+(var- macexvar nil)
 
 (defmacro if-let
   ``Make multiple bindings, and if all are truthy,
@@ -663,27 +753,18 @@
   (def len (length bindings))
   (if (= 0 len) (error "expected at least 1 binding"))
   (if (odd? len) (error "expected an even number of bindings"))
+  (def fal2 (if macexvar (macexvar fal) fal))
   (defn aux [i]
     (if (>= i len)
       tru
       (do
         (def bl (in bindings i))
         (def br (in bindings (+ 1 i)))
-        (def atm (idempotent? bl))
-        (def sym (if atm bl (gensym)))
-        (if atm
-          # Simple binding
-          (tuple 'do
-                 (tuple 'def sym br)
-                 (tuple 'if sym (aux (+ 2 i)) fal))
-          # Destructured binding
-          (tuple 'do
-                 (tuple 'def sym br)
-                 (tuple 'if sym
-                        (tuple 'do
-                               (tuple 'def bl sym)
-                               (aux (+ 2 i)))
-                        fal))))))
+        (if (symbol? bl)
+          ~(if (def ,bl ,br) ,(aux (+ 2 i)) ,fal2)
+          ~(if (def ,(def sym (gensym)) ,br)
+             (do (def ,bl ,sym) ,(aux (+ 2 i)))
+             ,fal2)))))
   (aux 0))
 
 (defmacro when-let
@@ -698,11 +779,11 @@
   (case (length functions)
     0 nil
     1 (in functions 0)
-    2 (let [[f g] functions] (fn [& x] (f (g ;x))))
-    3 (let [[f g h] functions] (fn [& x] (f (g (h ;x)))))
-    4 (let [[f g h i] functions] (fn [& x] (f (g (h (i ;x))))))
+    2 (let [[f g] functions] (fn :comp [& x] (f (g ;x))))
+    3 (let [[f g h] functions] (fn :comp [& x] (f (g (h ;x)))))
+    4 (let [[f g h i] functions] (fn :comp [& x] (f (g (h (i ;x))))))
     (let [[f g h i] functions]
-      (comp (fn [x] (f (g (h (i x)))))
+      (comp (fn :comp [x] (f (g (h (i x)))))
             ;(tuple/slice functions 4 -1)))))
 
 (defn identity
@@ -713,32 +794,40 @@
 (defn complement
   "Returns a function that is the complement to the argument."
   [f]
-  (fn [x] (not (f x))))
+  (fn :complement [x] (not (f x))))
+
+(defmacro- do-extreme
+  [order args]
+  ~(do
+     (def ds ,args)
+     (var k (next ds nil))
+     (var ret (get ds k))
+     (while (,not= nil (set k (next ds k)))
+       (def x (in ds k))
+       (if (,order x ret) (set ret x)))
+     ret))
 
 (defn extreme
   ``Returns the most extreme value in `args` based on the function `order`.
   `order` should take two values and return true or false (a comparison).
   Returns nil if `args` is empty.``
-  [order args]
-  (var [ret] args)
-  (each x args (if (order x ret) (set ret x)))
-  ret)
+  [order args] (do-extreme order args))
 
 (defn max
   "Returns the numeric maximum of the arguments."
-  [& args] (extreme > args))
+  [& args] (do-extreme > args))
 
 (defn min
   "Returns the numeric minimum of the arguments."
-  [& args] (extreme < args))
+  [& args] (do-extreme < args))
 
 (defn max-of
   "Returns the numeric maximum of the argument sequence."
-  [args] (extreme > args))
+  [args] (do-extreme > args))
 
 (defn min-of
   "Returns the numeric minimum of the argument sequence."
-  [args] (extreme < args))
+  [args] (do-extreme < args))
 
 (defn first
   "Get the first element from an indexed data structure."
@@ -752,6 +841,24 @@
 
 ## Polymorphic comparisons
 
+(defmacro- do-compare
+  [x y]
+  (def f (gensym))
+  (def f-res (gensym))
+  (def g (gensym))
+  (def g-res (gensym))
+  ~(do
+     (def ,f (,get ,x :compare))
+     (def ,f-res (if ,f (,f ,x ,y)))
+     (if ,f-res
+       ,f-res
+       (do
+         (def ,g (,get ,y :compare))
+         (def ,g-res (if ,g (,- (,g ,y ,x))))
+         (if ,g-res
+           ,g-res
+           (,cmp ,x ,y))))))
+
 (defn compare
   ``Polymorphic compare. Returns -1, 0, 1 for x < y, x = y, x > y respectively.
   Differs from the primitive comparators in that it first checks to
@@ -759,20 +866,18 @@
   compare x and y. If so, it uses that method. If not, it
   delegates to the primitive comparators.``
   [x y]
-  (or
-    (when-let [f (get x :compare)] (f x y))
-    (when-let [f (get y :compare)] (- (f y x)))
-    (cmp x y)))
+  (do-compare x y))
 
-(defn- compare-reduce [op xs]
-  (var r true)
-  (loop [i :range [0 (- (length xs) 1)]
-         :let [c (compare (xs i) (xs (+ i 1)))
-               ok (op c 0)]
-         :when (not ok)]
-    (set r false)
-    (break))
-  r)
+(defmacro- compare-reduce [op xs]
+  ~(do
+     (var res true)
+     (var x (get ,xs 0))
+     (forv i 1 (length ,xs)
+       (let [y (in ,xs i)]
+         (if (,op (do-compare x y) 0)
+           (set x y)
+           (do (set res false) (break)))))
+     res))
 
 (defn compare=
   ``Equivalent of `=` but using polymorphic `compare` instead of primitive comparator.``
@@ -812,21 +917,31 @@
 ###
 ###
 
-(defn- median-of-three [a b c]
-  (if (not= (> a b) (> a c))
-    a
-    (if (not= (> b a) (> b c)) b c)))
+(defmacro- median-of-three
+  [x y z]
+  ~(if (<= ,x ,y)
+     (if (<= ,y ,z) ,y (if (<= ,z ,x) ,x ,z))
+     (if (<= ,z ,y) ,y (if (<= ,x ,z) ,x ,z))))
+
+(defmacro- sort-partition-template
+  [ind before? left right pivot]
+  ~(do
+     (while (,before? (in ,ind ,left) ,pivot) (++ ,left))
+     (while (,before? ,pivot (in ,ind ,right)) (-- ,right))))
 
 (defn- sort-help [a lo hi before?]
   (when (< lo hi)
-    (def pivot
-      (median-of-three (in a hi) (in a lo)
-                       (in a (math/floor (/ (+ lo hi) 2)))))
+    (def [x y z] [(in a lo)
+                  (in a (div (+ lo hi) 2))
+                  (in a hi)])
+    (def pivot (median-of-three x y z))
     (var left lo)
     (var right hi)
     (while true
-      (while (before? (in a left) pivot) (++ left))
-      (while (before? pivot (in a right)) (-- right))
+      (case before?
+        < (sort-partition-template a < left right pivot)
+        > (sort-partition-template a > left right pivot)
+        (sort-partition-template a before? left right pivot))
       (when (<= left right)
         (def tmp (in a left))
         (set (a left) (in a right))
@@ -834,8 +949,10 @@
         (++ left)
         (-- right))
       (if (>= left right) (break)))
-    (sort-help a lo right before?)
-    (sort-help a left hi before?))
+    (if (< lo right)
+      (sort-help a lo right before?))
+    (if (< left hi)
+      (sort-help a left hi before?)))
   a)
 
 (defn sort
@@ -843,13 +960,14 @@
   If a `before?` comparator function is provided, sorts elements using that,
   otherwise uses `<`.``
   [ind &opt before?]
-  (sort-help ind 0 (- (length ind) 1) (or before? <)))
+  (default before? <)
+  (sort-help ind 0 (- (length ind) 1) before?))
 
 (defn sort-by
   ``Sorts `ind` in-place by calling a function `f` on each element and
   comparing the result with `<`.``
   [f ind]
-  (sort ind (fn [x y] (< (f x) (f y)))))
+  (sort ind (fn :sort-by-comp [x y] (< (f x) (f y)))))
 
 (defn sorted
   ``Returns a new sorted array without modifying the old one.
@@ -862,7 +980,7 @@
   ``Returns a new sorted array that compares elements by invoking
   a function `f` on each element and comparing the result with `<`.``
   [f ind]
-  (sorted ind (fn [x y] (< (f x) (f y)))))
+  (sorted ind (fn :sorted-by-comp [x y] (< (f x) (f y)))))
 
 (defn reduce
   ``Reduce, also know as fold-left in many languages, transforms
@@ -878,7 +996,7 @@
 
 (defn reduce2
   ``The 2-argument version of `reduce` that does not take an initialization value.
-  Instead, the first element of the array is used for initialization.``
+  Instead, the first element of the array is used for initialization. If `ind` is empty, will evaluate to nil.``
   [f ind]
   (var k (next ind))
   (if (= nil k) (break nil))
@@ -918,67 +1036,67 @@
     (set k (next ind k)))
   ret)
 
+(defmacro- map-aggregator
+  `Aggregation logic for various map functions.`
+  [maptype res val]
+  (case maptype
+    :map ~(array/push ,res ,val)
+    :mapcat ~(array/concat ,res ,val)
+    :keep ~(if (def y ,val) (array/push ,res y))
+    :count ~(if ,val (++ ,res))
+    :some ~(if (def y ,val) (do (set ,res y) (break)))
+    :all ~(if (def y ,val) nil (do (set ,res y) (break)))))
+
+(defmacro- map-n
+  `Generates efficient map logic for a specific number of
+  indexed beyond the first.`
+  [n maptype res f ind inds]
+  ~(do
+     (def ,(seq [k :range [0 n]] (symbol 'ind k)) ,inds)
+     ,;(seq [k :range [0 n]] ~(var ,(symbol 'key k) nil))
+     (each x ,ind
+       ,;(seq [k :range [0 n]]
+           ~(if (= nil (set ,(symbol 'key k) (next ,(symbol 'ind k) ,(symbol 'key k)))) (break)))
+       (map-aggregator ,maptype ,res (,f x ,;(seq [k :range [0 n]] ~(in ,(symbol 'ind k) ,(symbol 'key k))))))))
+
+(defmacro- map-template
+  [maptype res f ind inds]
+  ~(do
+     (def ninds (length ,inds))
+     (case ninds
+       0 (each x ,ind (map-aggregator ,maptype ,res (,f x)))
+       1 (map-n 1 ,maptype ,res ,f ,ind ,inds)
+       2 (map-n 2 ,maptype ,res ,f ,ind ,inds)
+       3 (map-n 3 ,maptype ,res ,f ,ind ,inds)
+       (do
+         (def iter-keys (array/new-filled ninds))
+         (def call-buffer (array/new-filled ninds))
+         (var done false)
+         (each x ,ind
+           (forv i 0 ninds
+             (let [old-key (in iter-keys i)
+                   ii (in ,inds i)
+                   new-key (next ii old-key)]
+               (if (= nil new-key)
+                 (do (set done true) (break))
+                 (do (set (iter-keys i) new-key) (set (call-buffer i) (in ii new-key))))))
+           (if done (break))
+           (map-aggregator ,maptype ,res (,f x ;call-buffer)))))))
+
 (defn map
   `Map a function over every value in a data structure and
   return an array of the results.`
-  [f & inds]
-  (def ninds (length inds))
-  (if (= 0 ninds) (error "expected at least 1 indexed collection"))
+  [f ind & inds]
   (def res @[])
-  (def [i1 i2 i3 i4] inds)
-  (case ninds
-    1 (each x i1 (array/push res (f x)))
-    2 (do
-        (var k1 nil)
-        (var k2 nil)
-        (while true
-          (if (= nil (set k1 (next i1 k1))) (break))
-          (if (= nil (set k2 (next i2 k2))) (break))
-          (array/push res (f (in i1 k1) (in i2 k2)))))
-    3 (do
-        (var k1 nil)
-        (var k2 nil)
-        (var k3 nil)
-        (while true
-          (if (= nil (set k1 (next i1 k1))) (break))
-          (if (= nil (set k2 (next i2 k2))) (break))
-          (if (= nil (set k3 (next i3 k3))) (break))
-          (array/push res (f (in i1 k1) (in i2 k2) (in i3 k3)))))
-    4 (do
-        (var k1 nil)
-        (var k2 nil)
-        (var k3 nil)
-        (var k4 nil)
-        (while true
-          (if (= nil (set k1 (next i1 k1))) (break))
-          (if (= nil (set k2 (next i2 k2))) (break))
-          (if (= nil (set k3 (next i3 k3))) (break))
-          (if (= nil (set k4 (next i4 k4))) (break))
-          (array/push res (f (in i1 k1) (in i2 k2) (in i3 k3) (in i4 k4)))))
-    (do
-      (def iterkeys (array/new-filled ninds))
-      (var done false)
-      (def call-buffer @[])
-      (while true
-        (forv i 0 ninds
-          (let [old-key (in iterkeys i)
-                ii (in inds i)
-                new-key (next ii old-key)]
-            (if (= nil new-key)
-              (do (set done true) (break))
-              (do (set (iterkeys i) new-key) (array/push call-buffer (in ii new-key))))))
-        (if done (break))
-        (array/push res (f ;call-buffer))
-        (array/clear call-buffer))))
+  (map-template :map res f ind inds)
   res)
 
 (defn mapcat
   ``Map a function over every element in an array or tuple and
   use `array/concat` to concatenate the results.``
-  [f ind]
+  [f ind & inds]
   (def res @[])
-  (each x ind
-    (array/concat res (f x)))
+  (map-template :mapcat res f ind inds)
   res)
 
 (defn filter
@@ -994,48 +1112,20 @@
 (defn count
   ``Count the number of items in `ind` for which `(pred item)`
   is true.``
-  [pred ind]
-  (var counter 0)
-  (each item ind
-    (if (pred item)
-      (++ counter)))
-  counter)
+  [pred ind & inds]
+  (var res 0)
+  (map-template :count res pred ind inds)
+  res)
 
 (defn keep
   ``Given a predicate `pred`, return a new array containing the truthy results
   of applying `pred` to each element in the indexed collection `ind`. This is
   different from `filter` which returns an array of the original elements where
   the predicate is truthy.``
-  [pred ind]
+  [pred ind & inds]
   (def res @[])
-  (each item ind
-    (if-let [y (pred item)]
-      (array/push res y)))
+  (map-template :keep res pred ind inds)
   res)
-
-(defn range
-  `Create an array of values [start, end) with a given step.
-  With one argument, returns a range [0, end). With two arguments, returns
-  a range [start, end). With three, returns a range with optional step size.`
-  [& args]
-  (case (length args)
-    1 (do
-        (def [n] args)
-        (def arr (array/new n))
-        (forv i 0 n (put arr i i))
-        arr)
-    2 (do
-        (def [n m] args)
-        (def arr (array/new (- m n)))
-        (forv i n m (put arr (- i n) i))
-        arr)
-    3 (do
-        (def [n m s] args)
-        (cond
-          (zero? s) @[]
-          (neg? s) (seq [i :down [n m (- s)]] i)
-          (seq [i :range [n m s]] i)))
-    (error "expected 1 to 3 arguments to range")))
 
 (defn find-index
   ``Find the index of indexed type for which `pred` is true. Returns `dflt` if not found.``
@@ -1078,42 +1168,33 @@
     (set k (next ind k)))
   ret)
 
-(defn- take-n-fallback
-  [n xs]
-  (def res @[])
-  (when (> n 0)
-    (var left n)
-    (each x xs
-      (array/push res x)
-      (-- left)
-      (if (= 0 left) (break))))
-  res)
-
-(defn- take-until-fallback
-  [pred xs]
-  (def res @[])
-  (each x xs
-    (if (pred x) (break))
-    (array/push res x))
-  res)
-
-(defn- slice-n
+(defn- take-n-slice
   [f n ind]
   (def len (length ind))
-  # make sure end is in [0, len]
-  (def m (if (> n 0) n 0))
-  (def end (if (> m len) len m))
-  (f ind 0 end))
+  (def m (+ len n))
+  (def start (if (< n 0 m) m 0))
+  (def end (if (<= 0 n len) n len))
+  (f ind start end))
 
 (defn take
-  "Take the first n elements of a fiber, indexed or bytes type. Returns a new array, tuple or string, respectively."
+  ``Take the first n elements of a fiber, indexed or bytes type. Returns a new array, tuple or string,
+  respectively. If `n` is negative, takes the last `n` elements instead.``
   [n ind]
   (cond
-    (bytes? ind) (slice-n string/slice n ind)
-    (indexed? ind) (slice-n tuple/slice n ind)
-    (take-n-fallback n ind)))
+    (indexed? ind) (take-n-slice tuple/slice n ind)
+    (bytes? ind) (take-n-slice string/slice n ind)
+    (dictionary? ind) (do
+                        (var left n)
+                        (tabseq [[i x] :pairs ind :until (< (-- left) 0)] i x))
+    (do
+      (def res @[])
+      (var key nil)
+      (repeat n
+        (if (= nil (set key (next ind key))) (break))
+        (array/push res (in ind key)))
+      res)))
 
-(defn- slice-until
+(defn- take-until-slice
   [f pred ind]
   (def len (length ind))
   (def i (find-index pred ind))
@@ -1124,9 +1205,10 @@
   "Same as `(take-while (complement pred) ind)`."
   [pred ind]
   (cond
-    (bytes? ind) (slice-until string/slice pred ind)
-    (indexed? ind) (slice-until tuple/slice pred ind)
-    (take-until-fallback pred ind)))
+    (indexed? ind) (take-until-slice tuple/slice pred ind)
+    (bytes? ind) (take-until-slice string/slice pred ind)
+    (dictionary? ind) (tabseq [[i x] :pairs ind :until (pred x)] i x)
+    (seq [x :in ind :until (pred x)] x)))
 
 (defn take-while
   `Given a predicate, take only elements from a fiber, indexed, or bytes type that satisfy
@@ -1134,27 +1216,58 @@
   [pred ind]
   (take-until (complement pred) ind))
 
-(defn drop
-  ``Drop the first n elements in an indexed or bytes type. Returns a new tuple or string
-  instance, respectively.``
-  [n ind]
-  (def use-str (bytes? ind))
-  (def f (if use-str string/slice tuple/slice))
+(defn- drop-n-slice
+  [f n ind]
   (def len (length ind))
-  # make sure start is in [0, len]
-  (def m (if (> n 0) n 0))
-  (def start (if (> m len) len m))
-  (f ind start -1))
+  (cond
+    (<= 0 n len) (f ind n)
+    (< (- len) n 0) (f ind 0 (+ len n))
+    (f ind len)))
+
+(defn- drop-n-dict
+  [f n ind]
+  (def res (f ind))
+  (var left n)
+  (loop [[i x] :pairs ind :until (< (-- left) 0)] (set (res i) nil))
+  res)
+
+(defn drop
+  ``Drop the first `n` elements in an indexed or bytes type. Returns a new tuple or string
+  instance, respectively. If `n` is negative, drops the last `n` elements instead.``
+  [n ind]
+  (cond
+    (indexed? ind) (drop-n-slice tuple/slice n ind)
+    (bytes? ind) (drop-n-slice string/slice n ind)
+    (struct? ind) (drop-n-dict struct/to-table n ind)
+    (table? ind) (drop-n-dict table/clone n ind)
+    (do
+      (var key nil)
+      (repeat n
+        (if (= nil (set key (next ind key))) (break)))
+      ind)))
+
+(defn- drop-until-slice
+  [f pred ind]
+  (def len (length ind))
+  (def i (find-index pred ind))
+  (def start (if (nil? i) len i))
+  (f ind start))
+
+(defn- drop-until-dict
+  [f pred ind]
+  (def res (f ind))
+  (loop [[i x] :pairs ind :until (pred x)] (set (res i) nil))
+  res)
 
 (defn drop-until
   "Same as `(drop-while (complement pred) ind)`."
   [pred ind]
-  (def use-str (bytes? ind))
-  (def f (if use-str string/slice tuple/slice))
-  (def i (find-index pred ind))
-  (def len (length ind))
-  (def start (if (nil? i) len i))
-  (f ind start))
+  (cond
+    (indexed? ind) (drop-until-slice tuple/slice pred ind)
+    (bytes? ind) (drop-until-slice string/slice pred ind)
+    (struct? ind) (drop-until-dict struct/to-table pred ind)
+    (table? ind) (drop-until-dict table/clone pred ind)
+    (do (find pred ind) ind)))
 
 (defn drop-while
   `Given a predicate, remove elements from an indexed or bytes type that satisfy
@@ -1166,7 +1279,7 @@
   ``Returns the juxtaposition of functions. In other words,
   `((juxt* a b c) x)` evaluates to `[(a x) (b x) (c x)]`.``
   [& funs]
-  (fn [& args]
+  (fn :juxt* [& args]
     (def ret @[])
     (each f funs
       (array/push ret (f ;args)))
@@ -1179,20 +1292,17 @@
   (def $args (gensym))
   (each f funs
     (array/push parts (tuple apply f $args)))
-  (tuple 'fn (tuple '& $args) (tuple/slice parts 0)))
+  (tuple 'fn :juxt (tuple '& $args) (tuple/slice parts 0)))
 
-(defmacro defdyn
-  ``Define an alias for a keyword that is used as a dynamic binding. The
-  alias is a normal, lexically scoped binding that can be used instead of
-  a keyword to prevent typos. `defdyn` does not set dynamic bindings or otherwise
-  replace `dyn` and `setdyn`. The alias _must_ start and end with the `*` character, usually
-  called "earmuffs".``
-  [alias & more]
-  (assert (symbol? alias) "alias must be a symbol")
-  (assert (and (> (length alias) 2) (= 42 (first alias) (last alias))) "name must have leading and trailing '*' characters")
-  (def prefix (dyn :defdyn-prefix))
-  (def kw (keyword prefix (slice alias 1 -2)))
-  ~(def ,alias :dyn ,;more ,kw))
+(defn has-key?
+  "Check if a data structure `ds` contains the key `key`."
+  [ds key]
+  (not= nil (get ds key)))
+
+(defn has-value?
+  "Check if a data structure `ds` contains the value `value`. Will run in time proportional to the size of `ds`."
+  [ds value]
+  (not= nil (index-of value ds)))
 
 (defdyn *defdyn-prefix* ``Optional namespace prefix to add to keywords declared with `defdyn`.
   Use this to prevent keyword collisions between dynamic bindings.``)
@@ -1201,19 +1311,8 @@
 (defdyn *redef* "When set, allow dynamically rebinding top level defs. Will slow generated code and is intended to be used for development.")
 (defdyn *debug* "Enables a built in debugger on errors and other useful features for debugging in a repl.")
 (defdyn *exit* "When set, will cause the current context to complete. Can be set to exit from repl (or file), for example.")
-(defdyn *exit-value* "Set the return value from `run-context` upon an exit. By default, `run-context` will return nil.")
-
-(defdyn *macro-form*
-  "Inside a macro, is bound to the source form that invoked the macro")
-
-(defdyn *lint-error*
-  "The current lint error level. The error level is the lint level at which compilation will exit with an error and not continue.")
-
-(defdyn *lint-warn*
-  "The current lint warning level. The warning level is the lint level at which and error will be printed but compilation will continue as normal.")
-
-(defdyn *lint-levels*
-  "A table of keyword alias to numbers denoting a lint level. Can be used to provided custom aliases for numeric lint levels.")
+(defdyn *exit-value* "Set the return value from `run-context` upon an exit.")
+(defdyn *task-id* "When spawning a thread or fiber, the task-id can be assigned for concurrency control.")
 
 (defdyn *current-file*
   "Bound to the name of the currently compiling file.")
@@ -1234,6 +1333,29 @@
      (,eprintf (,dyn :pretty-format "%q") ,s)
      ,s))
 
+(defn keep-syntax
+  ``Creates a tuple with the tuple type and sourcemap of `before` but the
+  elements of `after`. If either one of its arguments is not a tuple, returns
+  `after` unmodified. Useful to preserve syntactic information when transforming
+  an ast in macros.``
+  [before after]
+  (if (and (= :tuple (type before))
+           (= :tuple (type after)))
+    (do
+      (def res (if (= :parens (tuple/type before))
+                 (tuple/slice after)
+                 (tuple/brackets ;after)))
+      (tuple/setmap res ;(tuple/sourcemap before)))
+    after))
+
+(defn keep-syntax!
+  ``Like `keep-syntax`, but if `after` is an array, it is coerced into a tuple.
+  Useful to preserve syntactic information when transforming an ast in macros.``
+  [before after]
+  (keep-syntax before (if (= :array (type after))
+                        (tuple/slice after)
+                        after)))
+
 (defmacro ->
   ``Threading macro. Inserts x as the second value in the first form
   in `forms`, and inserts the modified first form into the second form
@@ -1244,7 +1366,7 @@
                  (tuple (in n 0) (array/slice n 1))
                  (tuple n @[])))
     (def parts (array/concat @[h last] t))
-    (tuple/slice parts 0))
+    (keep-syntax! n parts))
   (reduce fop x forms))
 
 (defmacro ->>
@@ -1257,7 +1379,7 @@
                  (tuple (in n 0) (array/slice n 1))
                  (tuple n @[])))
     (def parts (array/concat @[h] t @[last]))
-    (tuple/slice parts 0))
+    (keep-syntax! n parts))
   (reduce fop x forms))
 
 (defmacro -?>
@@ -1273,7 +1395,7 @@
                  (tuple n @[])))
     (def sym (gensym))
     (def parts (array/concat @[h sym] t))
-    ~(let [,sym ,last] (if ,sym ,(tuple/slice parts 0))))
+    ~(let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
   (reduce fop x forms))
 
 (defmacro -?>>
@@ -1289,7 +1411,7 @@
                  (tuple n @[])))
     (def sym (gensym))
     (def parts (array/concat @[h] t @[sym]))
-    ~(let [,sym ,last] (if ,sym ,(tuple/slice parts 0))))
+    ~(let [,sym ,last] (if ,sym ,(keep-syntax! n parts))))
   (reduce fop x forms))
 
 (defn- walk-ind [f form]
@@ -1313,10 +1435,7 @@
     :table (walk-dict f form)
     :struct (table/to-struct (walk-dict f form))
     :array (walk-ind f form)
-    :tuple (let [x (walk-ind f form)]
-             (if (= :parens (tuple/type form))
-               (tuple/slice x)
-               (tuple/brackets ;x)))
+    :tuple (keep-syntax! form (walk-ind f form))
     form))
 
 (defn postwalk
@@ -1364,7 +1483,12 @@
   (def dyn-forms
     (seq [i :range [0 (length bindings) 2]]
       ~(setdyn ,(bindings i) ,(bindings (+ i 1)))))
-  ~(,resume (,fiber/new (fn [] ,;dyn-forms ,;body) :p)))
+  ~(,resume (,fiber/new (fn :with-dyns [] ,;dyn-forms ,;body) :p)))
+
+(defmacro with-env
+  `Run a block of code with a given environment table`
+  [env & body]
+  ~(,resume (,fiber/new (fn :with-env [] ,;body) : ,env)))
 
 (defmacro with-vars
   ``Evaluates `body` with each var in `vars` temporarily bound. Similar signature to
@@ -1379,7 +1503,7 @@
   (with-syms [ret f s]
     ~(do
        ,;saveold
-       (def ,f (,fiber/new (fn [] ,;setnew ,;body) :ti))
+       (def ,f (,fiber/new (fn :with-vars [] ,;setnew ,;body) :ti))
        (def ,ret (,resume ,f))
        ,;restoreold
        (if (= (,fiber/status ,f) :dead) ,ret (,propagate ,ret ,f)))))
@@ -1388,51 +1512,53 @@
   "Partial function application."
   [f & more]
   (if (zero? (length more)) f
-    (fn [& r] (f ;more ;r))))
+    (fn :partial [& r] (f ;more ;r))))
 
 (defn every?
-  ``Returns true if each value in `ind` is truthy, otherwise returns the first
-  falsey value.``
+  ``Evaluates to the last element of `ind` if all preceding elements are truthy,
+  otherwise evaluates to the first falsey element.``
   [ind]
   (var res true)
   (loop [x :in ind :while res]
-    (if x nil (set res x)))
+    (set res x))
   res)
 
 (defn any?
-  ``Returns the first truthy value in `ind`, otherwise nil.``
+  ``Evaluates to the last element of `ind` if all preceding elements are falsey,
+  otherwise evaluates to the first truthy element.``
   [ind]
   (var res nil)
   (loop [x :in ind :until res]
-    (if x (set res x)))
+    (set res x))
   res)
 
 (defn reverse!
   `Reverses the order of the elements in a given array or buffer and returns it
   mutated.`
   [t]
-  (def len-1 (- (length t) 1))
-  (def half (/ len-1 2))
-  (forv i 0 half
-    (def j (- len-1 i))
-    (def l (in t i))
-    (def r (in t j))
-    (put t i r)
-    (put t j l))
+  (var i 0)
+  (var j (length t))
+  (while (< i (-- j))
+    (def ti (in t i))
+    (put t i (in t j))
+    (put t j ti)
+    (++ i))
   t)
 
 (defn reverse
   `Reverses the order of the elements in a given array or tuple and returns
-  a new array. If a string or buffer is provided, returns an array of its
-  byte values, reversed.`
+  a new array. If a string or buffer is provided, returns a buffer instead.`
   [t]
-  (def len (length t))
-  (var n (- len 1))
-  (def ret (array/new len))
-  (while (>= n 0)
-    (array/push ret (in t n))
-    (-- n))
-  ret)
+  (if (lengthable? t)
+    (do
+      (var n (length t))
+      (def ret (if (bytes? t)
+                 (buffer/new-filled n)
+                 (array/new-filled n)))
+      (each v t
+        (put ret (-- n) v))
+      ret)
+    (reverse! (seq [v :in t] v))))
 
 (defn invert
   ``Given an associative data structure `ds`, returns a new table where the
@@ -1542,32 +1668,41 @@
 (defn keys
   "Get the keys of an associative data structure."
   [x]
-  (def arr @[])
-  (var k (next x nil))
-  (while (not= nil k)
-    (array/push arr k)
-    (set k (next x k)))
-  arr)
+  (if (lengthable? x)
+    (do
+      (def arr (array/new-filled (length x)))
+      (var i 0)
+      (eachk k x
+        (put arr i k)
+        (++ i))
+      arr)
+    (seq [k :keys x] k)))
 
 (defn values
   "Get the values of an associative data structure."
   [x]
-  (def arr @[])
-  (var k (next x nil))
-  (while (not= nil k)
-    (array/push arr (in x k))
-    (set k (next x k)))
-  arr)
+  (if (lengthable? x)
+    (do
+      (def arr (array/new-filled (length x)))
+      (var i 0)
+      (each v x
+        (put arr i v)
+        (++ i))
+      arr)
+    (seq [v :in x] v)))
 
 (defn pairs
   "Get the key-value pairs of an associative data structure."
   [x]
-  (def arr @[])
-  (var k (next x nil))
-  (while (not= nil k)
-    (array/push arr (tuple k (in x k)))
-    (set k (next x k)))
-  arr)
+  (if (lengthable? x)
+    (do
+      (def arr (array/new-filled (length x)))
+      (var i 0)
+      (eachp p x
+        (put arr i p)
+        (++ i))
+      arr)
+    (seq [p :pairs x] p)))
 
 (defn frequencies
   "Get the number of occurrences of each value in an indexed data structure."
@@ -1612,14 +1747,7 @@
 (defn interleave
   "Returns an array of the first elements of each col, then the second elements, etc."
   [& cols]
-  (def res @[])
-  (def ncol (length cols))
-  (when (> ncol 0)
-    (def len (min ;(map length cols)))
-    (loop [i :range [0 len]
-           ci :range [0 ncol]]
-      (array/push res (in (in cols ci) i))))
-  res)
+  (mapcat tuple ;cols))
 
 (defn distinct
   "Returns an array of the deduplicated values in `xs`."
@@ -1666,29 +1794,46 @@
   ``Returns a sequence of the elements of `ind` separated by
   `sep`. Returns a new array.``
   [sep ind]
+  (var k (next ind nil))
+  (if (not= nil k)
+    (if (lengthable? ind)
+      (do
+        (def ret (array/new-filled (- (* 2 (length ind)) 1) sep))
+        (var i 0)
+        (while (not= nil k)
+          (put ret i (in ind k))
+          (set k (next ind k))
+          (+= i 2))
+        ret)
+      (do
+        (def ret @[(in ind k)])
+        (while (not= nil (set k (next ind k)))
+          (array/push ret sep (in ind k)))
+        ret))
+    @[]))
+
+(defn- partition-slice
+  [f n ind]
+  (var [start end] [0 n])
   (def len (length ind))
-  (def ret (array/new (- (* 2 len) 1)))
-  (if (> len 0) (put ret 0 (in ind 0)))
-  (var i 1)
-  (while (< i len)
-    (array/push ret sep (in ind i))
-    (++ i))
+  (def parts (div len n))
+  (def ret (array/new-filled parts))
+  (forv k 0 parts
+    (put ret k (f ind start end))
+    (set start end)
+    (+= end n))
+  (if (< start len)
+    (array/push ret (f ind start)))
   ret)
 
 (defn partition
   ``Partition an indexed data structure `ind` into tuples
   of size `n`. Returns a new array.``
   [n ind]
-  (var i 0) (var nextn n)
-  (def len (length ind))
-  (def ret (array/new (math/ceil (/ len n))))
-  (def slicer (if (bytes? ind) string/slice tuple/slice))
-  (while (<= nextn len)
-    (array/push ret (slicer ind i nextn))
-    (set i nextn)
-    (+= nextn n))
-  (if (not= i len) (array/push ret (slicer ind i)))
-  ret)
+  (cond
+    (indexed? ind) (partition-slice tuple/slice n ind)
+    (bytes? ind) (partition-slice string/slice n ind)
+    (partition-slice tuple/slice n (values ind))))
 
 ###
 ###
@@ -1718,11 +1863,21 @@
 (defdyn *pretty-format*
   "Format specifier for the `pp` function")
 
+(defdyn *repl-prompt*
+  "Allow setting a custom prompt at the default REPL. Not all REPLs will respect this binding.")
+
 (defn pp
   ``Pretty-print to stdout or `(dyn *out*)`. The format string used is `(dyn *pretty-format* "%q")`.``
   [x]
   (printf (dyn *pretty-format* "%q") x)
   (flush))
+
+(defn file/lines
+  "Return an iterator over the lines of a file."
+  [file]
+  (coro
+    (while (def line (file/read file :line))
+      (yield line))))
 
 ###
 ###
@@ -1945,24 +2100,6 @@
 ###
 ###
 
-(defdyn *macro-lints*
-  ``Bound to an array of lint messages that will be reported by the compiler inside a macro.
-  To indicate an error or warning, a macro author should use `maclintf`.``)
-
-(defn maclintf
-  ``When inside a macro, call this function to add a linter warning. Takes
-  a `fmt` argument like `string/format`, which is used to format the message.``
-  [level fmt & args]
-  (def lints (dyn *macro-lints*))
-  (when lints
-    (def form (dyn *macro-form*))
-    (def [l c] (if (tuple? form) (tuple/sourcemap form) [nil nil]))
-    (def l (if-not (= -1 l) l))
-    (def c (if-not (= -1 c) c))
-    (def msg (string/format fmt ;args))
-    (array/push lints [level l c msg]))
-  nil)
-
 (defn macex1
   ``Expand macros in a form, but do not recursively expand macros.
   See `macex` docs for info on `on-binding`.``
@@ -2043,15 +2180,16 @@
      'upscope expandall})
 
   (defn dotup [t]
+    (if (= nil (next t)) (break ()))
     (def h (in t 0))
     (def s (in specs h))
     (def entry (or (dyn h) {}))
     (def m (do (def r (get entry :ref)) (if r (in r 0) (get entry :value))))
     (def m? (in entry :macro))
     (cond
-      s (s t)
+      s (keep-syntax t (s t))
       m? (do (setdyn *macro-form* t) (m ;(tuple/slice t 1)))
-      (tuple/slice (map recur t))))
+      (keep-syntax! t (map recur t))))
 
   (def ret
     (case (type x)
@@ -2065,21 +2203,61 @@
   ret)
 
 (defn all
-  ``Returns true if `(pred item)` returns a truthy value for every item in `xs`.
-  Otherwise, returns the first falsey `(pred item)` result encountered.
-  Returns true if `xs` is empty.``
-  [pred xs]
-  (var ret true)
-  (loop [x :in xs :while ret] (set ret (pred x)))
-  ret)
+  ``Returns true if `(pred item)` is truthy for every item in `ind`.
+  Otherwise, returns the first falsey result encountered.
+  Returns true if `ind` is empty.``
+  [pred ind & inds]
+  (var res true)
+  (map-template :all res pred ind inds)
+  res)
 
 (defn some
-  ``Returns nil if all `xs` are false or nil, otherwise returns the result of the
-  first truthy predicate, `(pred x)`.``
-  [pred xs]
-  (var ret nil)
-  (loop [x :in xs :while (not ret)] (if-let [y (pred x)] (set ret y)))
-  ret)
+  ``Returns nil if `(pred item)` is false or nil for every item in `ind`.
+  Otherwise, returns the first truthy result encountered.``
+  [pred ind & inds]
+  (var res nil)
+  (map-template :some res pred ind inds)
+  res)
+
+(defn freeze
+  `Freeze an object (make it immutable) and do a deep copy, making
+  child values also immutable. Closures, fibers, and abstract types
+  will not be recursively frozen, but all other types will.`
+  [x]
+  (def tx (type x))
+  (cond
+    (or (= tx :array) (= tx :tuple))
+    (tuple/slice (map freeze x))
+
+    (or (= tx :table) (= tx :struct))
+    (let [temp-tab @{}]
+      # Handle multiple unique keys that freeze. Result should
+      # be independent of iteration order.
+      (eachp [k v] x
+        (def kk (freeze k))
+        (def vv (freeze v))
+        (def old (get temp-tab kk))
+        (def new (if (= nil old) vv (max vv old)))
+        (put temp-tab kk new))
+      (table/to-struct temp-tab (freeze (getproto x))))
+
+    (= tx :buffer)
+    (string x)
+
+    x))
+
+(defn thaw
+  `Thaw an object (make it mutable) and do a deep copy, making
+  child value also mutable. Closures, fibers, and abstract
+  types will not be recursively thawed, but all other types will`
+  [ds]
+  (case (type ds)
+    :array (walk-ind thaw ds)
+    :tuple (walk-ind thaw ds)
+    :table (walk-dict thaw (table/proto-flatten ds))
+    :struct (walk-dict thaw (struct/proto-flatten ds))
+    :string (buffer ds)
+    ds))
 
 (defn deep-not=
   ``Like `not=`, but mutable types (arrays, tables, buffers) are considered
@@ -2088,12 +2266,26 @@
   (def tx (type x))
   (or
     (not= tx (type y))
-    (case tx
-      :tuple (or (not= (length x) (length y)) (some identity (map deep-not= x y)))
-      :array (or (not= (length x) (length y)) (some identity (map deep-not= x y)))
-      :struct (deep-not= (kvs x) (kvs y))
-      :table (deep-not= (table/to-struct x) (table/to-struct y))
-      :buffer (not= (string x) (string y))
+    (cond
+      (or (= tx :tuple) (= tx :array))
+      (or (not= (length x) (length y))
+          (do
+            (var ret false)
+            (forv i 0 (length x)
+              (def xx (in x i))
+              (def yy (in y i))
+              (if (deep-not= xx yy)
+                (break (set ret true))))
+            ret))
+      (or (= tx :struct) (= tx :table))
+      (or (not= (length x) (length y))
+          (do
+            (def rawget (if (= tx :struct) struct/rawget table/rawget))
+            (var ret false)
+            (eachp [k v] x
+              (if (deep-not= (rawget y k) v) (break (set ret true))))
+            ret))
+      (= tx :buffer) (not= 0 (- (length x) (length y)) (memcmp x y))
       (not= x y))))
 
 (defn deep=
@@ -2101,21 +2293,6 @@
   equal if they have identical structure. Much slower than `=`.``
   [x y]
   (not (deep-not= x y)))
-
-(defn freeze
-  `Freeze an object (make it immutable) and do a deep copy, making
-  child values also immutable. Closures, fibers, and abstract types
-  will not be recursively frozen, but all other types will.`
-  [x]
-  (case (type x)
-    :array (tuple/slice (map freeze x))
-    :tuple (tuple/slice (map freeze x))
-    :table (if-let [p (table/getproto x)]
-             (freeze (merge (table/clone p) x))
-             (struct ;(map freeze (kvs x))))
-    :struct (struct ;(map freeze (kvs x)))
-    :buffer (string x)
-    x))
 
 (defn macex
   ``Expand macros completely.
@@ -2133,6 +2310,8 @@
     (set previous current)
     (set current (macex1 current on-binding)))
   current)
+
+(set macexvar macex)
 
 (defmacro varfn
   ``Create a function that can be rebound. `varfn` has the same signature
@@ -2166,17 +2345,11 @@
 
 (defmacro short-fn
   ```
-  Shorthand for `fn`. Arguments are given as `$n`, where `n` is the 0-indexed
-  argument of the function. `$` is also an alias for the first (index 0) argument.
-  The `$&` symbol will make the anonymous function variadic if it appears in the
-  body of the function, and can be combined with positional arguments.
-
-  Example usage:
-
-      (short-fn (+ $ $)) # A function that doubles its arguments.
-      (short-fn (string $0 $1)) # accepting multiple args.
-      |(+ $ $) # use pipe reader macro for terse function literals.
-      |(+ $&)  # variadic functions
+  Shorthand for `fn`. Arguments are given as `$n`, where `n` is the
+  0-indexed argument of the function. `$` is also an alias for the
+  first (index 0) argument. The `$&` symbol will make the anonymous
+  function variadic if it appears in the body of the function, and
+  can be combined with positional arguments.
   ```
   [arg &opt name]
   (var max-param-seen -1)
@@ -2184,6 +2357,7 @@
   (defn saw-special-arg
     [num]
     (set max-param-seen (max max-param-seen num)))
+  (def prefix (gensym))
   (defn on-binding
     [x]
     (if (string/has-prefix? '$ x)
@@ -2191,22 +2365,24 @@
         (= '$ x)
         (do
           (saw-special-arg 0)
-          '$0)
+          (symbol prefix '$0))
         (= '$& x)
         (do
           (set vararg true)
-          x)
+          (symbol prefix x))
         :else
         (do
           (def num (scan-number (string/slice x 1)))
           (if (nat? num)
-            (saw-special-arg num))
-          x))
+            (do
+              (saw-special-arg num)
+              (symbol prefix x))
+            x)))
       x))
   (def expanded (macex arg on-binding))
-  (def name-splice (if name [name] []))
-  (def fn-args (seq [i :range [0 (+ 1 max-param-seen)]] (symbol '$ i)))
-  ~(fn ,;name-splice [,;fn-args ,;(if vararg ['& '$&] [])] ,expanded))
+  (def name-splice (if name [name] [:short-fn]))
+  (def fn-args (seq [i :range [0 (+ 1 max-param-seen)]] (symbol prefix '$ i)))
+  ~(fn ,;name-splice [,;fn-args ,;(if vararg ['& (symbol prefix '$&)] [])] ,expanded))
 
 ###
 ###
@@ -2221,26 +2397,36 @@
 (def default-peg-grammar
   `The default grammar used for pegs. This grammar defines several common patterns
   that should make it easier to write more complex patterns.`
-  ~@{:d (range "09")
-     :a (range "az" "AZ")
+  ~@{:a (range "az" "AZ")
+     :d (range "09")
+     :h (range "09" "af" "AF")
      :s (set " \t\r\n\0\f\v")
      :w (range "az" "AZ" "09")
-     :h (range "09" "af" "AF")
-     :S (if-not :s 1)
-     :W (if-not :w 1)
      :A (if-not :a 1)
      :D (if-not :d 1)
      :H (if-not :h 1)
-     :d+ (some :d)
+     :S (if-not :s 1)
+     :W (if-not :w 1)
      :a+ (some :a)
+     :d+ (some :d)
+     :h+ (some :h)
      :s+ (some :s)
      :w+ (some :w)
-     :h+ (some :h)
-     :d* (any :d)
+     :A+ (some :A)
+     :D+ (some :D)
+     :H+ (some :H)
+     :S+ (some :S)
+     :W+ (some :W)
      :a* (any :a)
-     :w* (any :w)
+     :d* (any :d)
+     :h* (any :h)
      :s* (any :s)
-     :h* (any :h)})
+     :w* (any :w)
+     :A* (any :A)
+     :D* (any :D)
+     :H* (any :H)
+     :S* (any :S)
+     :W* (any :W)})
 
 (setdyn *peg-grammar* default-peg-grammar)
 
@@ -2284,28 +2470,8 @@
     col
     ": parse error: "
     (:error p)
-    (if ec "\e[0m" ""))
+    (if ec "\e[0m"))
   (eflush))
-
-(defn- print-line-col
-  ``Print the source code at a line, column in a source file. If unable to open
-  the file, prints nothing.``
-  [where line col]
-  (if-not line (break))
-  (unless (string? where) (break))
-  (when-with [f (file/open where :r)]
-    (def source-code (file/read f :all))
-    (var index 0)
-    (repeat (dec line)
-      (if-not index (break))
-      (set index (string/find "\n" source-code index))
-      (if index (++ index)))
-    (when index
-      (def line-end (string/find "\n" source-code index))
-      (eprint "  " (string/slice source-code index line-end))
-      (when col
-        (+= index col)
-        (eprint (string/repeat " " (inc col)) "^")))))
 
 (defn warn-compile
   "Default handler for a compile warning."
@@ -2319,10 +2485,7 @@
     ":"
     col
     ": compile warning (" level "): ")
-  (eprint msg)
-  (when ec
-    (print-line-col where line col)
-    (eprin "\e[0m"))
+  (eprint msg (if ec "\e[0m"))
   (eflush))
 
 (defn bad-compile
@@ -2339,10 +2502,7 @@
     ": compile error: ")
   (if macrof
     (debug/stacktrace macrof msg "")
-    (eprint msg))
-  (when ec
-    (print-line-col where line col)
-    (eprin "\e[0m"))
+    (eprint msg (if ec "\e[0m")))
   (eflush))
 
 (defn curenv
@@ -2411,7 +2571,7 @@
         :read read
         :expander expand} opts)
   (default env (or (fiber/getenv (fiber/current)) @{}))
-  (default chunks (fn [buf p] (getline "" buf env)))
+  (default chunks (fn chunks [buf p] (getline "" buf env)))
   (default onstatus debug/stacktrace)
   (default on-compile-error bad-compile)
   (default on-compile-warning warn-compile)
@@ -2457,8 +2617,8 @@
                 (set good false)
                 (def {:error err :line line :column column :fiber errf} res)
                 (on-compile-error err errf where (or line l) (or column c))))))
-        guard))
-    (fiber/setenv f env)
+        guard
+        env))
     (while (fiber/can-resume? f)
       (def res (resume f resumeval))
       (when good (set resumeval (onstatus f res)))))
@@ -2509,7 +2669,6 @@
 
       (do
         (var pindex 0)
-        (var pstatus nil)
         (def len (length buf))
         (when (= len 0)
           (:eof p)
@@ -2545,9 +2704,9 @@
 
 (defn eval
   ``Evaluates a form in the current environment. If more control over the
-  environment is needed, use `run-context`.``
-  [form]
-  (def res (compile form nil :eval))
+  environment is needed, use `run-context`. Optionally pass in an `env` table with available bindings.``
+  [form &opt env]
+  (def res (compile form env :eval))
   (if (= (type res) :function)
     (res)
     (error (get res :error))))
@@ -2585,10 +2744,10 @@
 
 (defn eval-string
   ``Evaluates a string in the current environment. If more control over the
-  environment is needed, use `run-context`.``
-  [str]
+  environment is needed, use `run-context`. Optionally pass in an `env` table with available bindings.``
+  [str &opt env]
   (var ret nil)
-  (each x (parse-all str) (set ret (eval x)))
+  (each x (parse-all str) (set ret (eval x env)))
   ret)
 
 (def load-image-dict
@@ -2636,6 +2795,12 @@
 (defn- check-is-dep [x] (unless (or (string/has-prefix? "/" x) (string/has-prefix? "@" x) (string/has-prefix? "." x)) x))
 (defn- check-project-relative [x] (if (string/has-prefix? "/" x) x))
 
+(defdyn *module-cache* "Dynamic binding for overriding `module/cache`")
+(defdyn *module-paths* "Dynamic binding for overriding `module/paths`")
+(defdyn *module-loading* "Dynamic binding for overriding `module/loading`")
+(defdyn *module-loaders* "Dynamic binding for overriding `module/loaders`")
+(defdyn *module-make-env* "Dynamic binding for creating new environments for `import`, `require`, and `dofile`. Overrides `make-env`.")
+
 (def module/cache
   "A table, mapping loaded module identifiers to their environments."
   @{})
@@ -2664,24 +2829,43 @@
   keyword name of a loader in `module/loaders`. Returns the modified `module/paths`.
   ```
   [ext loader]
+  (def mp (dyn *module-paths* module/paths))
   (defn- find-prefix
     [pre]
-    (or (find-index |(and (string? ($ 0)) (string/has-prefix? pre ($ 0))) module/paths) 0))
+    (or (find-index |(and (string? ($ 0)) (string/has-prefix? pre ($ 0))) mp) 0))
   (def dyn-index (find-prefix ":@all:"))
-  (array/insert module/paths dyn-index [(string ":@all:" ext) loader check-dyn-relative])
+  (array/insert mp dyn-index [(string ":@all:" ext) loader check-dyn-relative])
   (def all-index (find-prefix ".:all:"))
-  (array/insert module/paths all-index [(string ".:all:" ext) loader check-project-relative])
+  (array/insert mp all-index [(string ".:all:" ext) loader check-project-relative])
   (def sys-index (find-prefix ":sys:"))
-  (array/insert module/paths sys-index [(string ":sys:/:all:" ext) loader check-is-dep])
+  (array/insert mp sys-index [(string ":sys:/:all:" ext) loader check-is-dep])
   (def curall-index (find-prefix ":cur:/:all:"))
-  (array/insert module/paths curall-index [(string ":cur:/:all:" ext) loader check-relative])
-  module/paths)
+  (array/insert mp curall-index [(string ":cur:/:all:" ext) loader check-relative])
+  mp)
+
+# Don't expose this externally yet - could break if custom module/paths is setup.
+(defn- module/add-syspath
+  ```
+  Add a custom syspath to `module/paths` by duplicating all entries that being with `:sys:` and
+  adding duplicates with a specific path prefix instead.
+  ```
+  [path]
+  (def copies @[])
+  (var last-index 0)
+  (def mp (dyn *module-paths* module/paths))
+  (eachp [index entry] mp
+    (def pattern (first entry))
+    (when (and (string? pattern) (string/has-prefix? ":sys:/" pattern))
+      (set last-index index)
+      (array/push copies [(string/replace ":sys:" path pattern) ;(drop 1 entry)])))
+  (array/insert mp (+ 1 last-index) ;copies)
+  mp)
 
 (module/add-paths ":native:" :native)
 (module/add-paths "/init.janet" :source)
 (module/add-paths ".janet" :source)
 (module/add-paths ".jimage" :image)
-(array/insert module/paths 0 [(fn is-cached [path] (if (in module/cache path) path)) :preload check-not-relative])
+(array/insert module/paths 0 [(fn is-cached [path] (if (in (dyn *module-cache* module/cache) path) path)) :preload check-not-relative])
 
 # Version of fexists that works even with a reduced OS
 (defn- fexists
@@ -2711,7 +2895,8 @@
   ```
   [path]
   (var ret nil)
-  (each [p mod-kind checker] module/paths
+  (def mp (dyn *module-paths* module/paths))
+  (each [p mod-kind checker] mp
     (when (mod-filter checker path)
       (if (function? p)
         (when-let [res (p path)]
@@ -2723,11 +2908,11 @@
             (set ret [fullpath mod-kind])
             (break))))))
   (if ret ret
-    (let [expander (fn [[t _ chk]]
+    (let [expander (fn :expander [[t _ chk]]
                      (when (string? t)
                        (when (mod-filter chk path)
                          (module/expand-path path t))))
-          paths (filter identity (map expander module/paths))
+          paths (filter identity (map expander mp))
           str-parts (interpose "\n    " paths)]
       [nil (string "could not find module " path ":\n    " ;str-parts)])))
 
@@ -2790,12 +2975,17 @@
   set to a truthy value."
   [env &opt level is-repl]
   (default level 1)
-  (fn [f x]
+  (fn :debugger [f x]
     (def fs (fiber/status f))
     (if (= :dead fs)
       (when is-repl
         (put env '_ @{:value x})
-        (printf (get env :pretty-format "%q") x)
+        (def pf (get env *pretty-format* "%q"))
+        (try
+          (printf pf x)
+          ([e]
+            (eprintf "bad pretty format %v: %v" pf e)
+            (eflush)))
         (flush))
       (do
         (debug/stacktrace f x "")
@@ -2815,7 +3005,7 @@
            :core/stream path
            (file/open path :rb)))
   (def path-is-file (= f path))
-  (default env (make-env))
+  (default env ((dyn *module-make-env* make-env)))
   (def spath (string path))
   (put env :source (or source (if-not path-is-file spath path)))
   (var exit-error nil)
@@ -2875,15 +3065,17 @@
   ``A table of loading method names to loading functions.
   This table lets `require` and `import` load many different kinds
   of files as modules.``
-  @{:native (fn native-loader [path &] (native path (make-env)))
+  @{:native (fn native-loader [path &] (native path ((dyn *module-make-env* make-env))))
     :source (fn source-loader [path args]
-              (put module/loading path true)
-              (defer (put module/loading path nil)
+              (def ml (dyn *module-loading* module/loading))
+              (put ml path true)
+              (defer (put ml path nil)
                 (dofile path ;args)))
     :preload (fn preload-loader [path & args]
-               (when-let [m (in module/cache path)]
+               (def mc (dyn *module-cache* module/cache))
+               (when-let [m (in mc path)]
                  (if (function? m)
-                   (set (module/cache path) (m path ;args))
+                   (set (mc path) (m path ;args))
                    m)))
     :image (fn image-loader [path &] (load-image (slurp path)))})
 
@@ -2891,15 +3083,18 @@
   [path args kargs]
   (def [fullpath mod-kind] (module/find path))
   (unless fullpath (error mod-kind))
-  (if-let [check (if-not (kargs :fresh) (in module/cache fullpath))]
+  (def mc (dyn *module-cache* module/cache))
+  (def ml (dyn *module-loading* module/loading))
+  (def mls (dyn *module-loaders* module/loaders))
+  (if-let [check (if-not (kargs :fresh) (in mc fullpath))]
     check
-    (if (module/loading fullpath)
+    (if (ml fullpath)
       (error (string "circular dependency " fullpath " detected"))
       (do
-        (def loader (if (keyword? mod-kind) (module/loaders mod-kind) mod-kind))
+        (def loader (if (keyword? mod-kind) (mls mod-kind) mod-kind))
         (unless loader (error (string "module type " mod-kind " unknown")))
         (def env (loader fullpath args))
-        (put module/cache fullpath env)
+        (put mc fullpath env)
         env))))
 
 (defn require
@@ -2913,9 +3108,10 @@
   ``Merge a module source into the `target` environment with a `prefix`, as with the `import` macro.
   This lets users emulate the behavior of `import` with a custom module table.
   If `export` is truthy, then merged functions are not marked as private. Returns
-  the modified target environment.``
-  [target source &opt prefix export]
-  (loop [[k v] :pairs source :when (symbol? k) :when (not (v :private))]
+  the modified target environment. If a tuple or array `only` is passed, only merge keys in `only`.``
+  [target source &opt prefix export only]
+  (def only-set (if only (invert only)))
+  (loop [[k v] :pairs source :when (symbol? k) :when (not (v :private)) :when (or (not only) (in only-set k))]
     (def newv (table/setproto @{:private (not export)} v))
     (put target (symbol prefix k) newv))
   target)
@@ -2928,13 +3124,14 @@
   (def kargs (table ;args))
   (def {:as as
         :prefix prefix
-        :export ep} kargs)
+        :export ep
+        :only only} kargs)
   (def newenv (require-1 path args kargs))
   (def prefix (or
                 (and as (string as "/"))
                 prefix
                 (string (last (string/split "/" path)) "/")))
-  (merge-module env newenv prefix ep))
+  (merge-module env newenv prefix ep only))
 
 (defmacro import
   ``Import a module. First requires the module, and then merges its
@@ -2944,10 +3141,11 @@
   to re-export the imported symbols. If "`:exit true`" is given as an argument,
   any errors encountered at the top level in the module will cause `(os/exit 1)`
   to be called. Dynamic bindings will NOT be imported. Use :fresh to bypass the
-  module cache.``
+  module cache. Use `:only [foo bar baz]` to only import select bindings into the
+  current environment.``
   [path & args]
   (def ps (partition 2 args))
-  (def argm (mapcat (fn [[k v]] [k (if (= k :as) (string v) v)]) ps))
+  (def argm (mapcat (fn [[k v]] [k (case k :as (string v) :only ~(quote ,v) v)]) ps))
   (tuple import* (string path) ;argm))
 
 (defmacro use
@@ -2987,6 +3185,7 @@
   (from prototype tables).``
   [&opt env local]
   (env-walk keyword? env local))
+
 
 (defdyn *doc-width*
   "Width in columns to print documentation printed with `doc-format`.")
@@ -3140,16 +3339,17 @@
       (cond
         (or (= b (chr "\n")) (= b (chr " "))) (endtoken)
         (= b (chr "`")) (delim :code)
-        (not (modes :code)) (cond
+        (not (modes :code))
+        (cond
           (= b (chr `\`)) (do
                             (++ token-length)
                             (buffer/push token (get line (++ i))))
           (= b (chr "_")) (delim :underline)
           (= b (chr "*"))
-            (if (= (chr "*") (get line (+ i 1)))
-              (do (++ i)
-                (delim :bold))
-              (delim :italics))
+          (if (= (chr "*") (get line (+ i 1)))
+            (do (++ i)
+              (delim :bold))
+            (delim :italics))
           (do (++ token-length) (buffer/push token b)))
         (do (++ token-length) (buffer/push token b))))
     (endtoken)
@@ -3295,9 +3495,9 @@
 (defn- print-special-form-entry
   [x]
   (print "\n\n"
-         (string "    special form\n\n")
-         (string "    (" x " ...)\n\n")
-         (string "    See https://janet-lang.org/docs/specials.html\n\n")))
+         "    special form\n\n"
+         "    (" x " ...)\n\n"
+         "    See https://janet-lang.org/docs/specials.html\n\n"))
 
 (defn doc*
   "Get the documentation for a symbol in a given environment. Function form of `doc`."
@@ -3431,6 +3631,24 @@
     (when-let [constants (dasm :constants)]
       (eprintf "  constants:  %.4q" constants))
     (eprintf "  slots:      %.4q\n" (frame :slots))
+    (when-let [src-path (in dasm :source)]
+      (when (and (fexists src-path)
+                 sourcemap)
+        (defn dump
+          [src cur]
+          (def offset 5)
+          (def beg (max 1 (- cur offset)))
+          (def lines (array/concat @[""] (string/split "\n" src)))
+          (def end (min (+ cur offset) (length lines)))
+          (def digits (inc (math/floor (math/log10 end))))
+          (def fmt-str (string "%" digits "d: %s"))
+          (for i beg end
+            (eprin " ") # breakpoint someday?
+            (eprin (if (= i cur) "> " "  "))
+            (eprintf fmt-str i (get lines i))))
+        (let [[sl _] (sourcemap pc)]
+          (dump (slurp src-path) sl)
+          (eprint))))
     (def padding (string/repeat " " 20))
     (loop [i :range [0 (length bytecode)]
            :let [instr (bytecode i)]]
@@ -3531,7 +3749,7 @@
   [&opt chunks onsignal env parser read]
   (default env (make-env))
   (default chunks
-    (fn [buf p]
+    (fn :chunks [buf p]
       (getline
         (string
           "repl:"
@@ -3562,44 +3780,80 @@
     Returns a fiber that is scheduled to run the function.
     ```
     [f & args]
-    (ev/go (fn _call [&] (f ;args))))
+    (ev/go (fn :call [&] (f ;args))))
 
   (defmacro ev/spawn
     "Run some code in a new fiber. This is shorthand for `(ev/go (fn [] ;body))`."
     [& body]
-    ~(,ev/go (fn _spawn [&] ,;body)))
+    ~(,ev/go (fn :spawn [&] ,;body)))
 
   (defmacro ev/do-thread
     ``Run some code in a new thread. Suspends the current fiber until the thread is complete, and
     evaluates to nil.``
     [& body]
-    ~(,ev/thread (fn _do-thread [&] ,;body)))
+    ~(,ev/thread (fn :do-thread [&] ,;body)))
+
+  (defn- acquire-release
+    [acq rel lock body]
+    (def l (gensym))
+    ~(do
+       (def ,l ,lock)
+       (,acq ,l)
+       (defer (,rel ,l)
+         ,;body)))
+
+  (defmacro ev/with-lock
+    ``Run a body of code after acquiring a lock. Will automatically release the lock when done.``
+    [lock & body]
+    (acquire-release ev/acquire-lock ev/release-lock lock body))
+
+  (defmacro ev/with-rlock
+    ``Run a body of code after acquiring read access to an rwlock. Will automatically release the lock when done.``
+    [lock & body]
+    (acquire-release ev/acquire-rlock ev/release-rlock lock body))
+
+  (defmacro ev/with-wlock
+    ``Run a body of code after acquiring write access to an rwlock. Will automatically release the lock when done.``
+    [lock & body]
+    (acquire-release ev/acquire-wlock ev/release-wlock lock body))
 
   (defmacro ev/spawn-thread
     ``Run some code in a new thread. Like `ev/do-thread`, but returns nil immediately.``
     [& body]
-    ~(,ev/thread (fn _spawn-thread [&] ,;body) nil :n))
+    ~(,ev/thread (fn :spawn-thread [&] ,;body) nil :n))
 
   (defmacro ev/with-deadline
-    `Run a body of code with a deadline, such that if the code does not complete before
-    the deadline is up, it will be canceled.`
-    [deadline & body]
+    ``
+    Create a fiber to execute `body`, schedule the event loop to cancel
+    the task (root fiber) associated with `body`'s fiber, and start
+    `body`'s fiber by resuming it.
+
+    The event loop will try to cancel the root fiber if `body`'s fiber
+    has not completed after at least `sec` seconds.
+
+    `sec` is a number that can have a fractional part.
+    ``
+    [sec & body]
     (with-syms [f]
       ~(let [,f (coro ,;body)]
-         (,ev/deadline ,deadline nil ,f)
+         (,ev/deadline ,sec nil ,f)
          (,resume ,f))))
 
-  (defn- cancel-all [fibers reason] (each f fibers (ev/cancel f reason) (put fibers f nil)))
+  (defn- cancel-all [chan fibers reason]
+    (each f fibers (ev/cancel f reason))
+    (let [n (length fibers)]
+      (table/clear fibers)
+      (repeat n (ev/take chan))))
 
   (defn- wait-for-fibers
     [chan fibers]
-    (defer (cancel-all fibers "parent canceled")
+    (defer (cancel-all chan fibers "parent canceled")
       (repeat (length fibers)
         (def [sig fiber] (ev/take chan))
         (if (= sig :ok)
           (put fibers fiber nil)
           (do
-            (cancel-all fibers "sibling canceled")
+            (cancel-all chan fibers "sibling canceled")
             (propagate (fiber/last-value fiber) fiber))))))
 
   (defmacro ev/gather
@@ -3615,7 +3869,7 @@
          (def ,res @[])
          ,;(seq [[i body] :pairs bodies]
              ~(do
-                (def ,ftemp (,ev/go (fn [] (put ,res ,i ,body)) nil ,chan))
+                (def ,ftemp (,ev/go (fn :ev/gather [] (put ,res ,i ,body)) nil ,chan))
                 (,put ,fset ,ftemp ,ftemp)))
          (,wait-for-fibers ,chan ,fset)
          ,res))))
@@ -3623,10 +3877,10 @@
 (compwhen (dyn 'net/listen)
   (defn net/server
     "Start a server asynchronously with `net/listen` and `net/accept-loop`. Returns the new server stream."
-    [host port &opt handler type]
-    (def s (net/listen host port type))
+    [host port &opt handler type no-reuse]
+    (def s (net/listen host port type no-reuse))
     (if handler
-      (ev/call (fn [] (net/accept-loop s handler))))
+      (ev/go (fn [] (net/accept-loop s handler))))
     s))
 
 ###
@@ -3661,7 +3915,7 @@
     (string/replace-all "-" "_" name))
 
   (defn ffi/context
-    "Set the path of the dynamic library to implictly bind, as well
+    "Set the path of the dynamic library to implicitly bind, as well
      as other global state for ease of creating native bindings."
     [&opt native-path &named map-symbols lazy]
     (default map-symbols default-mangle)
@@ -3674,9 +3928,11 @@
               :lazy lazy
               :map-symbols map-symbols}))
 
-  (defmacro ffi/defbind
-    "Generate bindings for native functions in a convenient manner."
-    [name ret-type & body]
+  (defmacro ffi/defbind-alias
+    "Generate bindings for native functions in a convenient manner.
+     Similar to defbind but allows for the janet function name to be
+     different than the FFI function."
+    [name alias ret-type & body]
     (def real-ret-type (eval ret-type))
     (def meta (slice body 0 -2))
     (def arg-pairs (partition 2 (last body)))
@@ -3691,12 +3947,17 @@
     (defn make-sig []
       (ffi/signature :default real-ret-type ;computed-type-args))
     (defn make-ptr []
-      (assert (ffi/lookup (if lazy (llib) lib) raw-symbol) (string "failed to find ffi symbol " raw-symbol)))
+      (assertf (ffi/lookup (if lazy (llib) lib) raw-symbol) "failed to find ffi symbol %v" raw-symbol))
     (if lazy
-        ~(defn ,name ,;meta [,;formal-args]
-           (,ffi/call (,(delay (make-ptr))) (,(delay (make-sig))) ,;formal-args))
-        ~(defn ,name ,;meta [,;formal-args]
-           (,ffi/call ,(make-ptr) ,(make-sig) ,;formal-args)))))
+      ~(defn ,alias ,;meta [,;formal-args]
+         (,ffi/call (,(delay (make-ptr))) (,(delay (make-sig))) ,;formal-args))
+      ~(defn ,alias ,;meta [,;formal-args]
+         (,ffi/call ,(make-ptr) ,(make-sig) ,;formal-args))))
+
+  (defmacro ffi/defbind
+    "Generate bindings for native functions in a convenient manner."
+    [name ret-type & body]
+    ~(ffi/defbind-alias ,name ,name ,ret-type ,;body)))
 
 ###
 ###
@@ -3773,6 +4034,413 @@
   (merge-into module/cache old-modcache)
   nil)
 
+###
+###
+### Bundle tools
+###
+###
+
+(compwhen (dyn 'os/stat)
+
+  (def- seps {:windows "\\" :mingw "\\" :cygwin "\\"})
+  (defn- sep [] (get seps (os/which) "/"))
+
+  (defn- bundle-rpath
+    [path]
+    (os/realpath path))
+
+  (defn- bundle-dir
+    [&opt bundle-name]
+    (def s (sep))
+    (string (bundle-rpath (dyn *syspath*)) s "bundle" (if bundle-name s) bundle-name))
+
+  (defn- bundle-file
+    [bundle-name filename]
+    (def s (sep))
+    (string (bundle-rpath (dyn *syspath*)) s "bundle" s bundle-name s filename))
+
+  (defn- get-manifest-filename
+    [bundle-name]
+    (bundle-file bundle-name "manifest.jdn"))
+
+  (defn- prime-bundle-paths
+    []
+    (def s (sep))
+    (def path (bundle-dir))
+    (os/mkdir path)
+    (assert (os/stat path :mode)))
+
+  (defn- get-files [manifest]
+    (def files (get manifest :files @[]))
+    (put manifest :files files)
+    files)
+
+  (defn- rmrf
+    "rm -rf in janet"
+    [x]
+    (case (os/lstat x :mode)
+      nil nil
+      :directory (do
+                   (def s (sep))
+                   (each y (os/dir x)
+                     (rmrf (string x s y)))
+                   (os/rmdir x))
+      (os/rm x))
+    nil)
+
+  (defn- copyfile
+    [from to]
+    (if-with [ffrom (file/open from :rb)]
+      (if-with [fto (file/open to :wb)]
+        (do
+          (def perm (os/stat from :permissions))
+          (def b (buffer/new 0x10000))
+          (forever
+            (file/read ffrom 0x10000 b)
+            (when (empty? b) (buffer/trim b) (os/chmod to perm) (break))
+            (file/write fto b)
+            (buffer/clear b)))
+        (errorf "destination file %s cannot be opened for writing" to))
+      (errorf "source file %s cannot be opened for reading" from)))
+
+  (defn- copyrf
+    [from to]
+    (case (os/stat from :mode)
+      :file (copyfile from to)
+      :directory (do
+                   (def s (sep))
+                   (os/mkdir to)
+                   (each y (os/dir from)
+                     (copyrf (string from s y) (string to s y)))))
+    nil)
+
+  (defn- sync-manifest
+    [manifest]
+    (def bn (get manifest :name))
+    (def manifest-name (get-manifest-filename bn))
+    (spit manifest-name (string/format "%j\n" manifest)))
+
+  (defn bundle/manifest
+    "Get the manifest for a give installed bundle"
+    [bundle-name]
+    (def name (get-manifest-filename bundle-name))
+    (assertf (fexists name) "no bundle %v found" bundle-name)
+    (parse (slurp name)))
+
+  (defn- get-bundle-module
+    [bundle-name]
+    (def manifest (bundle/manifest bundle-name))
+    (def dir (os/cwd))
+    (def workdir (get manifest :local-source "."))
+    (def fixed-syspath (bundle-rpath (dyn *syspath*)))
+    (try
+      (os/cd workdir)
+      ([_] (print "cannot enter source directory " workdir " for bundle " bundle-name)))
+    (defer (os/cd dir)
+      (def new-env (make-env (curenv)))
+      (put new-env *module-cache* @{})
+      (put new-env *module-loading* @{})
+      (put new-env *module-make-env* (fn make-bundle-env [&] (make-env new-env)))
+      (put new-env :workdir workdir)
+      (put new-env :name bundle-name)
+      (put new-env *syspath* fixed-syspath)
+      (with-env new-env
+        (put new-env :bundle-dir (bundle-dir bundle-name)) # get the syspath right
+        (require (string "@syspath/bundle/" bundle-name)))))
+
+  (defn- do-hook
+    [module bundle-name hook & args]
+    (def hookf (module/value module (symbol hook)))
+    (unless hookf (break))
+    (def manifest (bundle/manifest bundle-name))
+    (def dir (os/cwd))
+    (os/cd (get module :workdir "."))
+    (defer (os/cd dir)
+      (print "running hook " hook " for bundle " bundle-name)
+      (hookf ;args)))
+
+  (defn bundle/list
+    "Get a list of all installed bundles in lexical order."
+    []
+    (def d (bundle-dir))
+    (if (os/stat d :mode)
+      (sort (os/dir d))
+      @[]))
+
+  (defn- bundle-uninstall-unchecked
+    [bundle-name]
+    (def man (bundle/manifest bundle-name))
+    (def all-hooks (get man :hooks @[]))
+    (when (index-of :uninstall all-hooks)
+      (def module (get-bundle-module bundle-name))
+      (do-hook module bundle-name :uninstall man))
+    (def files (get man :files []))
+    (each file (reverse files)
+      (print "remove " file)
+      (case (os/stat file :mode)
+        :file (os/rm file)
+        :directory (os/rmdir file)))
+    (rmrf (bundle-dir bundle-name))
+    nil)
+
+  (defn bundle/uninstall
+    "Remove a bundle from the current syspath"
+    [bundle-name]
+    (def breakage @{})
+    (each b (bundle/list)
+      (unless (= b bundle-name)
+        (def m (bundle/manifest b))
+        (def deps (get m :dependencies []))
+        (each d deps
+          (if (= d bundle-name) (put breakage b true)))))
+    (when (next breakage)
+      (def breakage-list (sorted (keys breakage)))
+      (errorf "cannot uninstall %s, breaks dependent bundles %n" bundle-name breakage-list))
+    (bundle-uninstall-unchecked bundle-name))
+
+  (defn bundle/topolist
+    "Get topological order of all bundles, such that each bundle is listed after its dependencies."
+    []
+    (def visited @{})
+    (def cycle-detect @{})
+    (def order @[])
+    (def stack @[])
+    (defn visit
+      [b]
+      (array/push stack b)
+      (if (get visited b) (break))
+      (if (get cycle-detect b) (errorf "cycle detected in bundle dependencies: %s" (string/join stack " -> ")))
+      (put cycle-detect b true)
+      (each d (get (bundle/manifest b) :dependencies []) (visit d))
+      (put cycle-detect b nil)
+      (put visited b true)
+      (array/pop stack)
+      (array/push order b))
+    (each b (bundle/list) (visit b))
+    order)
+
+  (defn bundle/prune
+    "Remove all orphaned bundles from the syspath. An orphaned bundle is a bundle that is
+     marked for :auto-remove and is not depended on by any other bundle."
+    []
+    (def topo (bundle/topolist))
+    (def rtopo (reverse topo))
+    # Check which auto-remove packages can be dropped
+    # Iterate in (reverse) topological order, and if we see an auto-remove package and have not already seen
+    # something that depends on it, then it is a root package and can be pruned.
+    (def exempt @{})
+    (def to-drop @[])
+    (each b rtopo
+      (def m (bundle/manifest b))
+      (if (or (get exempt b) (not (get m :auto-remove)))
+        (do
+          (put exempt b true)
+          (each d (get m :dependencies []) (put exempt d true)))
+        (array/push to-drop b)))
+    (print "pruning " (length to-drop) " bundles")
+    (each b to-drop
+      (print "uninstall " b))
+    (each b to-drop
+      (print "uninstalling " b)
+      (bundle-uninstall-unchecked b)))
+
+  (defn bundle/installed?
+    "Check if a bundle is installed."
+    [bundle-name]
+    (not (not (os/stat (bundle-dir bundle-name) :mode))))
+
+  (defn bundle/install
+    "Install a bundle from the local filesystem. The name of the bundle will be inferred from the bundle, or passed as a parameter :name in `config`."
+    [path &keys config]
+    (def path (bundle-rpath path))
+    (def clean (get config :clean))
+    (def check (get config :check))
+    (def s (sep))
+    # Check meta file for dependencies and default name
+    (def infofile-pre-1 (string path s "bundle" s "info.jdn"))
+    (def infofile-pre (if (fexists infofile-pre-1) infofile-pre-1 (string path s "info.jdn"))) # allow for alias
+    (var default-bundle-name nil)
+    (when (os/stat infofile-pre :mode)
+      (def info (-> infofile-pre slurp parse))
+      (def deps (get info :dependencies @[]))
+      (set default-bundle-name (get info :name))
+      (def missing (seq [d :in deps :when (not (bundle/installed? d))] (string d)))
+      (when (next missing) (errorf "missing dependencies %s" (string/join missing ", "))))
+    (def bundle-name (get config :name default-bundle-name))
+    (assertf bundle-name "unable to infer bundle name for %v, use :name argument" path)
+    (assertf (not (string/check-set "\\/" bundle-name))
+             "bundle name %v cannot contain path separators" bundle-name)
+    (assert (next bundle-name) "cannot use empty bundle-name")
+    (assert (not (fexists (get-manifest-filename bundle-name)))
+            "bundle is already installed")
+    # Setup installed paths
+    (prime-bundle-paths)
+    (os/mkdir (bundle-dir bundle-name))
+    # Aliases for common bundle/ files
+    (def bundle.janet (string path s "bundle.janet"))
+    (when (fexists bundle.janet) (copyfile bundle.janet (bundle-file bundle-name "init.janet")))
+    (when (fexists infofile-pre) (copyfile infofile-pre (bundle-file bundle-name "info.jdn")))
+    # Copy some files into the new location unconditionally
+    (def implicit-sources (string path s "bundle"))
+    (when (= :directory (os/stat implicit-sources :mode))
+      (copyrf implicit-sources (bundle-dir bundle-name)))
+    (def man @{:name bundle-name :local-source path :files @[]})
+    (merge-into man config)
+    (def infofile (bundle-file bundle-name "info.jdn"))
+    (put man :auto-remove (get config :auto-remove))
+    (sync-manifest man)
+    (edefer (do (print "installation error, uninstalling") (bundle/uninstall bundle-name))
+      (when (os/stat infofile :mode)
+        (def info (-> infofile slurp parse))
+        (def deps (get info :dependencies @[]))
+        (def missing (filter (complement bundle/installed?) deps))
+        (when (next missing)
+          (error (string "missing dependencies " (string/join missing ", "))))
+        (put man :dependencies deps)
+        (put man :info info))
+      (def module (get-bundle-module bundle-name))
+      (def all-hooks (seq [[k v] :pairs module :when (symbol? k) :unless (get v :private)] (keyword k)))
+      (put man :hooks all-hooks)
+      (do-hook module bundle-name :dependencies man)
+      (when clean
+        (do-hook module bundle-name :clean man))
+      (do-hook module bundle-name :build man)
+      (do-hook module bundle-name :install man)
+      (if (empty? (get man :files)) (print "no files installed, is this a valid bundle?"))
+      (sync-manifest man)
+      (when check
+        (do-hook module bundle-name :check man)))
+    (print "installed " bundle-name)
+    bundle-name)
+
+  (defn- bundle/pack
+    "Take an installed bundle and create a bundle source directory that can be used to
+     reinstall the bundle on a compatible system. This is used to create backups for installed
+     bundles without rebuilding, or make a prebuilt bundle for other systems."
+    [bundle-name dest-dir &opt is-backup]
+    (var i 0)
+    (def man (bundle/manifest bundle-name))
+    (def files (get man :files @[]))
+    (assertf (os/mkdir dest-dir) "could not create directory %v (or it already exists)" dest-dir)
+    (def s (sep))
+    (os/mkdir (string dest-dir s "bundle"))
+    (def install-hook (string dest-dir s "bundle" s "init.janet"))
+    (edefer (rmrf dest-dir) # don't leave garbage on failure
+      (def install-source @[])
+      (def syspath (bundle-rpath (dyn *syspath*)))
+      (when is-backup (copyrf (bundle-dir bundle-name) (string dest-dir s "old-bundle")))
+      (each file files
+        (def {:mode mode :permissions perm} (os/stat file))
+        (def relpath (string/triml (slice file (length syspath) -1) s))
+        (case mode
+          :directory (array/push install-source ~(bundle/add-directory manifest ,relpath ,perm))
+          :file (do
+                  (def filename (string/format "file_%06d" (++ i)))
+                  (copyfile file (string dest-dir s filename))
+                  (array/push install-source ~(bundle/add-file manifest ,filename ,relpath ,perm)))
+          (errorf "unexpected file %v" file)))
+      (def b @"(defn install [manifest]")
+      (each form install-source (buffer/format b "\n  %j" form))
+      (buffer/push b ")\n")
+      (spit install-hook b))
+    dest-dir)
+
+  (defn bundle/reinstall
+    "Reinstall an existing bundle from the local source code."
+    [bundle-name &keys new-config]
+    (def manifest (bundle/manifest bundle-name))
+    (def path (get manifest :local-source))
+    (def config (get manifest :config @{}))
+    (def s (sep))
+    (assert (= :directory (os/stat path :mode)) "local source not available")
+    (def backup-dir (string (dyn *syspath*) s bundle-name ".backup"))
+    (rmrf backup-dir)
+    (def backup-bundle-source (bundle/pack bundle-name backup-dir true))
+    (edefer (do
+              (bundle/install backup-bundle-source :name bundle-name)
+              (copyrf (string backup-bundle-source s "old-bundle") (bundle-dir bundle-name))
+              (rmrf backup-bundle-source))
+      (bundle-uninstall-unchecked bundle-name)
+      (bundle/install path :name bundle-name ;(kvs config) ;(kvs new-config)))
+    (rmrf backup-bundle-source)
+    bundle-name)
+
+  (defn bundle/add-directory
+    "Add a directory during the install process relative to `(dyn *syspath*)`"
+    [manifest dest &opt chmod-mode]
+    (def files (get-files manifest))
+    (def s (sep))
+    (def absdest (string (dyn *syspath*) s dest))
+    (unless (os/mkdir absdest)
+      (errorf "collision at %s, directory already exists" absdest))
+    (def absdest (os/realpath absdest))
+    (array/push files absdest)
+    (when chmod-mode
+      (os/chmod absdest chmod-mode))
+    (print "add " absdest)
+    absdest)
+
+  (defn bundle/whois
+    "Given a file path, figure out which bundle installed it."
+    [path]
+    (var ret nil)
+    (def rpath (bundle-rpath path))
+    (each bundle-name (bundle/list)
+      (def files (get (bundle/manifest bundle-name) :files []))
+      (def has-file (index-of rpath files))
+      (when has-file
+        (set ret bundle-name)
+        (break)))
+    ret)
+
+  (defn bundle/add-file
+    "Add files during an install relative to `(dyn *syspath*)`"
+    [manifest src &opt dest chmod-mode]
+    (default dest src)
+    (def files (get-files manifest))
+    (def s (sep))
+    (def absdest (string (dyn *syspath*) s dest))
+    (when (os/stat absdest :mode)
+      (errorf "collision at %s, file already exists" absdest))
+    (copyfile src absdest)
+    (def absdest (os/realpath absdest))
+    (array/push files absdest)
+    (when chmod-mode
+      (os/chmod absdest chmod-mode))
+    (print "add " absdest)
+    absdest)
+
+  (defn bundle/add
+    "Add files and directories during a bundle install relative to `(dyn *syspath*)`.
+     Added paths will be recorded in the bundle manifest such that they are properly tracked
+     and removed during an upgrade or uninstall."
+    [manifest src &opt dest chmod-mode]
+    (default dest src)
+    (def s (sep))
+    (def mode (os/stat src :mode))
+    (if-not mode (errorf "file %s does not exist" src))
+    (case mode
+      :directory
+      (let [absdest (bundle/add-directory manifest dest chmod-mode)]
+        (each d (os/dir src) (bundle/add manifest (string src s d) (string dest s d) chmod-mode))
+        absdest)
+      :file (bundle/add-file manifest src dest chmod-mode)
+      (errorf "bad path %s - file is a %s" src mode)))
+
+  (defn bundle/add-bin
+    `Shorthand for adding scripts during an install. Scripts will be installed to
+    (string (dyn *syspath*) "/bin") by default and will be set to be executable.`
+    [manifest src &opt dest chmod-mode]
+    (default dest (last (string/split "/" src)))
+    (default chmod-mode 8r755)
+    (os/mkdir (string (dyn *syspath*) (sep) "bin"))
+    (bundle/add-file manifest src (string "bin" (sep) dest) chmod-mode))
+
+  (defn bundle/update-all
+    "Reinstall all bundles"
+    [&keys configs]
+    (each bundle (bundle/topolist)
+      (bundle/reinstall bundle ;(kvs configs)))))
 
 ###
 ###
@@ -3790,8 +4458,7 @@
     (def guard (if (get env :debug) :ydt :y))
     (defn wrap-main [&]
       (main ;subargs))
-    (def f (fiber/new wrap-main guard))
-    (fiber/setenv f env)
+    (def f (fiber/new wrap-main guard env))
     (var res nil)
     (while (fiber/can-resume? f)
       (set res (resume f res))
@@ -3807,6 +4474,31 @@
 
 (defdyn *profilepath*
   "Path to profile file loaded when starting up the repl.")
+
+(compwhen (not (dyn 'os/isatty))
+  (defmacro os/isatty [&] true))
+
+(def- long-to-short
+  "map long options to short options"
+  {"-help" "h"
+   "-version" "v"
+   "-stdin" "s"
+   "-eval" "e"
+   "-expression" "E"
+   "-debug" "d"
+   "-repl" "r"
+   "-noprofile" "R"
+   "-persistent" "p"
+   "-quiet" "q"
+   "-flycheck" "k"
+   "-syspath" "m"
+   "-compile" "c"
+   "-image" "i"
+   "-nocolor" "n"
+   "-color" "N"
+   "-library" "l"
+   "-lint-warn" "w"
+   "-lint-error" "x"})
 
 (defn cli-main
   `Entrance for the Janet CLI tool. Call this function with the command line
@@ -3828,8 +4520,16 @@
   (var error-level nil)
   (var expect-image false)
 
-  (if-let [jp (getenv-alias "JANET_PATH")] (setdyn *syspath* jp))
+  (when-let [jp (getenv-alias "JANET_PATH")]
+    (def path-sep (if (index-of (os/which) [:windows :mingw]) ";" ":"))
+    (def paths (reverse! (string/split path-sep jp)))
+    (for i 1 (length paths)
+      (module/add-syspath (get paths i)))
+    (setdyn *syspath* (first paths)))
   (if-let [jprofile (getenv-alias "JANET_PROFILE")] (setdyn *profilepath* jprofile))
+  (set colorize (and
+                  (not (getenv-alias "NO_COLOR"))
+                  (os/isatty stdout)))
 
   (defn- get-lint-level
     [i]
@@ -3843,25 +4543,26 @@
            (print
              ```
              Options are:
-               -h : Show this help
-               -v : Print the version string
-               -s : Use raw stdin instead of getline like functionality
-               -e code : Execute a string of janet
-               -E code arguments... : Evaluate  an expression as a short-fn with arguments
-               -d : Set the debug flag in the REPL
-               -r : Enter the REPL after running all scripts
-               -R : Disables loading profile.janet when JANET_PROFILE is present
-               -p : Keep on executing if there is a top-level error (persistent)
-               -q : Hide logo (quiet)
-               -k : Compile scripts but do not execute (flycheck)
-               -m syspath : Set system path for loading global modules
-               -c source output : Compile janet source code into an image
-               -i : Load the script argument as an image file instead of source code
-               -n : Disable ANSI color output in the REPL
-               -l lib : Use a module before processing more arguments
-               -w level : Set the lint warning level - default is "normal"
-               -x level : Set the lint error level - default is "none"
-               -- : Stop handling options
+               --help (-h)             : Show this help
+               --version (-v)          : Print the version string
+               --stdin (-s)            : Use raw stdin instead of getline like functionality
+               --eval (-e) code        : Execute a string of janet
+               --expression (-E) code arguments... : Evaluate an expression as a short-fn with arguments
+               --debug (-d)            : Set the debug flag in the REPL
+               --repl (-r)             : Enter the REPL after running all scripts
+               --noprofile (-R)        : Disables loading profile.janet when JANET_PROFILE is present
+               --persistent (-p)       : Keep on executing if there is a top-level error (persistent)
+               --quiet (-q)            : Hide logo (quiet)
+               --flycheck (-k)         : Compile scripts but do not execute (flycheck)
+               --syspath (-m) syspath  : Set system path for loading global modules
+               --compile (-c) source output : Compile janet source code into an image
+               --image (-i)            : Load the script argument as an image file instead of source code
+               --nocolor (-n)          : Disable ANSI color output in the REPL
+               --color (-N)            : Enable ANSI color output in the REPL
+               --library (-l) lib      : Use a module before processing more arguments
+               --lint-warn (-w) level  : Set the lint warning level - default is "normal"
+               --lint-error (-x) level : Set the lint error level - default is "none"
+               --                      : Stop handling options
              ```)
            (os/exit 0)
            1)
@@ -3873,11 +4574,18 @@
      "i" (fn [&] (set expect-image true) 1)
      "k" (fn [&] (set compile-only true) (set exit-on-error false) 1)
      "n" (fn [&] (set colorize false) 1)
+     "N" (fn [&] (set colorize true) 1)
      "m" (fn [i &] (setdyn *syspath* (in args (+ i 1))) 2)
      "c" (fn c-switch [i &]
            (def path (in args (+ i 1)))
            (def e (dofile path))
-           (spit (in args (+ i 2)) (make-image e))
+           (def output-path
+             (if (< (+ i 2) (length args))
+               (in args (+ i 2))
+               (string
+                 (if (string/has-suffix? ".janet" path) (string/slice path 0 -7) path)
+                 ".jimage")))
+           (spit output-path (make-image e))
            (set no-file false)
            3)
      "-" (fn [&] (set handleopts false) 1)
@@ -3904,8 +4612,8 @@
      "R" (fn [&] (setdyn *profilepath* nil) 1)})
 
   (defn- dohandler [n i &]
-    (def h (in handlers n))
-    (if h (h i) (do (print "unknown flag -" n) ((in handlers "h")))))
+    (def h (in handlers (get long-to-short n n)))
+    (if h (h i handlers) (do (print "unknown flag -" n) ((in handlers "h")))))
 
   # Process arguments
   (var i 0)
@@ -3949,17 +4657,15 @@
         (if-not quiet
           (print "Janet " janet/version "-" janet/build " " (os/which) "/" (os/arch) "/" (os/compiler) " - '(doc)' for help"))
         (flush)
+        (def env (make-env))
         (defn getprompt [p]
+          (when-let [custom-prompt (get env *repl-prompt*)] (break (custom-prompt p)))
           (def [line] (parser/where p))
           (string "repl:" line ":" (parser/state p :delimiters) "> "))
         (defn getstdin [prompt buf _]
           (file/write stdout prompt)
           (file/flush stdout)
           (file/read stdin :line buf))
-        (def env (make-env))
-        (when-let [profile.janet (dyn *profilepath*)]
-          (def new-env (dofile profile.janet :exit true))
-          (merge-module env new-env "" false))
         (when debug-flag
           (put env *debug* true)
           (put env *redef* true))
@@ -3971,6 +4677,9 @@
         (setdyn *doc-color* (if colorize true))
         (setdyn *lint-error* error-level)
         (setdyn *lint-warn* error-level)
+        (when-let [profile.janet (dyn *profilepath*)]
+          (dofile profile.janet :exit true :env env)
+          (put env *current-file* nil))
         (repl getchunk nil env)))))
 
 ###
@@ -3990,6 +4699,10 @@
       (put flat :doc nil))
     (when (boot/config :no-sourcemaps)
       (put flat :source-map nil))
+    (unless (boot/config :no-docstrings)
+      (unless (v :private)
+        (unless (v :doc)
+          (errorf "no docs: %v %p" k v)))) # make sure we have docs
     # Fix directory separators on windows to make image identical between windows and non-windows
     (when-let [sm (get flat :source-map)]
       (put flat :source-map [(string/replace-all "\\" "/" (sm 0)) (sm 1) (sm 2)]))
@@ -4047,6 +4760,7 @@
      "src/core/ev.c"
      "src/core/ffi.c"
      "src/core/fiber.c"
+     "src/core/filewatch.c"
      "src/core/gc.c"
      "src/core/inttypes.c"
      "src/core/io.c"
@@ -4081,10 +4795,11 @@
 
   (defn do-one-file
     [fname]
-    (print "\n/* " fname " */")
-    (print "#line 0 \"" fname "\"\n")
-    (def source (slurp fname))
-    (print (string/replace-all "\r" "" source)))
+    (unless (has-value? boot/args "image-only")
+      (print "\n/* " fname " */")
+      (print "#line 0 \"" fname "\"\n")
+      (def source (slurp fname))
+      (print (string/replace-all "\r" "" source))))
 
   (do-one-file feature-header)
 
@@ -4104,9 +4819,8 @@
   (each s core-sources
     (do-one-file s))
 
-  # Create C source file that contains images a uint8_t buffer. This
-  # can be compiled and linked statically into the main janet library
-  # and example client.
+  # Create C source file that contains the boot image in a uint8_t buffer. This
+  # can be compiled and linked statically into the main janet library and client
   (print "static const unsigned char janet_core_image_bytes[] = {")
   (loop [line :in (partition 16 image)]
     (prin "  ")

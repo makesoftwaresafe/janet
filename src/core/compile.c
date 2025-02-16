@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023 Calvin Rose
+* Copyright (c) 2024 Calvin Rose
 *
 * Permission is hereby granted, free of charge, to any person obtaining a copy
 * of this software and associated documentation files (the "Software"), to
@@ -422,6 +422,7 @@ JanetSlot *janetc_toslots(JanetCompiler *c, const Janet *vals, int32_t len) {
     int32_t i;
     JanetSlot *ret = NULL;
     JanetFopts subopts = janetc_fopts_default(c);
+    subopts.flags |= JANET_FOPTS_ACCEPT_SPLICE;
     for (i = 0; i < len; i++) {
         janet_v_push(ret, janetc_value(subopts, vals[i]));
     }
@@ -432,6 +433,7 @@ JanetSlot *janetc_toslots(JanetCompiler *c, const Janet *vals, int32_t len) {
 JanetSlot *janetc_toslotskv(JanetCompiler *c, Janet ds) {
     JanetSlot *ret = NULL;
     JanetFopts subopts = janetc_fopts_default(c);
+    subopts.flags |= JANET_FOPTS_ACCEPT_SPLICE;
     const JanetKV *kvs = NULL;
     int32_t cap = 0, len = 0;
     janet_dictionary_view(ds, &kvs, &len, &cap);
@@ -744,12 +746,14 @@ static int macroexpand1(
     int lock = janet_gclock();
     Janet mf_kw = janet_ckeywordv("macro-form");
     janet_table_put(c->env, mf_kw, x);
+    Janet ml_kw = janet_ckeywordv("macro-lints");
+    if (c->lints) {
+        janet_table_put(c->env, ml_kw, janet_wrap_array(c->lints));
+    }
     Janet tempOut;
     JanetSignal status = janet_continue(fiberp, janet_wrap_nil(), &tempOut);
     janet_table_put(c->env, mf_kw, janet_wrap_nil());
-    if (c->lints) {
-        janet_table_put(c->env, janet_ckeywordv("macro-lints"), janet_wrap_array(c->lints));
-    }
+    janet_table_put(c->env, ml_kw, janet_wrap_nil());
     janet_gcunlock(lock);
     if (status != JANET_SIGNAL_OK) {
         const uint8_t *es = janet_formatc("(macro) %V", tempOut);
@@ -930,7 +934,7 @@ JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c) {
         int32_t slotchunks = (def->slotcount + 31) >> 5;
         /* numchunks is min of slotchunks and scope->ua.count */
         int32_t numchunks = slotchunks > scope->ua.count ? scope->ua.count : slotchunks;
-        uint32_t *chunks = janet_calloc(sizeof(uint32_t), slotchunks);
+        uint32_t *chunks = janet_calloc(slotchunks, sizeof(uint32_t));
         if (NULL == chunks) {
             JANET_OUT_OF_MEMORY;
         }
@@ -969,12 +973,21 @@ JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c) {
     for (int32_t i = 0; i < janet_v_count(scope->syms); i++) {
         SymPair pair = scope->syms[i];
         if (pair.sym2) {
-            if (pair.death_pc == UINT32_MAX) {
-                pair.death_pc = def->bytecode_length;
-            }
             JanetSymbolMap jsm;
-            jsm.birth_pc = pair.birth_pc;
-            jsm.death_pc = pair.death_pc;
+            if (pair.death_pc == UINT32_MAX) {
+                jsm.death_pc = def->bytecode_length;
+            } else {
+                jsm.death_pc = pair.death_pc - scope->bytecode_start;
+            }
+            /* Handle birth_pc == 0 correctly */
+            if ((uint32_t) scope->bytecode_start > pair.birth_pc) {
+                jsm.birth_pc = 0;
+            } else {
+                jsm.birth_pc = pair.birth_pc - scope->bytecode_start;
+            }
+            janet_assert(jsm.birth_pc <= jsm.death_pc, "birth pc after death pc");
+            janet_assert(jsm.birth_pc < (uint32_t) def->bytecode_length, "bad birth pc");
+            janet_assert(jsm.death_pc <= (uint32_t) def->bytecode_length, "bad death pc");
             jsm.slot_index = pair.slot.index;
             jsm.symbol = pair.sym2;
             janet_v_push(locals, jsm);
@@ -986,6 +999,10 @@ JanetFuncDef *janetc_pop_funcdef(JanetCompiler *c) {
 
     /* Pop the scope */
     janetc_popscope(c);
+
+    /* Do basic optimization */
+    janet_bytecode_movopt(def);
+    janet_bytecode_remove_noops(def);
 
     return def;
 }
@@ -1039,7 +1056,7 @@ JanetCompileResult janet_compile_lint(Janet source,
 
     if (c.result.status == JANET_COMPILE_OK) {
         JanetFuncDef *def = janetc_pop_funcdef(&c);
-        def->name = janet_cstring("_thunk");
+        def->name = janet_cstring("thunk");
         janet_def_addflags(def);
         c.result.funcdef = def;
     } else {
