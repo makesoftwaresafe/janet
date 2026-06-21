@@ -285,8 +285,9 @@ JANET_CORE_FN(os_exit,
     } else {
         status = EXIT_FAILURE;
     }
+    int force = (argc >= 2 && janet_truthy(argv[1]));
     janet_deinit();
-    if (argc >= 2 && janet_truthy(argv[1])) {
+    if (force) {
 #ifdef JANET_PLAN9
         exits(nil);
 #else
