@@ -1115,7 +1115,7 @@
   no `inds` are provided. Multiple data structures can be handled
   if each `inds` is a data structure and `f` is a function of
   arity one more than the number of `inds`. Note that `f` is only
-  applied to values at indeces up to the largest index of the
+  applied to values at indices up to the largest index of the
   shortest of `ind` and each of `inds`.
   ```
   [f ind & inds]
@@ -1140,7 +1140,7 @@
   provided. Multiple data structures can be handled if each `inds`
   is a data structure and `pred` is a function of arity one more
   than the number of `inds`. Note that `pred` is only applied to
-  values at indeces up to the largest index of the shortest of
+  values at indices up to the largest index of the shortest of
   `ind` and each of `inds`.
   ```
   [pred ind & inds]
